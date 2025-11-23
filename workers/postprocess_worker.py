@@ -7,15 +7,23 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import json
 
-import aiobotocore.session
 import aiofiles
 import aiofiles.os
 import aiohttp
+
+# Azure Blob Storage config (async)
+from azure.storage.blob.aio import ContainerClient
 
 from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
 
 logger = logging.getLogger(__name__)
 
+
+#map of s3 field names to blob storage field names
+S3_FIELD_MAP = {
+    "endpoint_url": "connection_string",
+    "bucket_name": "container_name",
+}
 
 class PostprocessWorker:
     """
@@ -62,7 +70,7 @@ class PostprocessWorker:
                     # Move generated assets to organized directory
                     await self.move_assets(request_id, result)
                     
-                    # Handle S3 upload - check payload first, then environment variables
+                    # Handle S3 upload - check payload first, then environment variables, we are using s3 field names to support base container
                     s3_config = await self.get_s3_config(request.input)
                     if s3_config:
                         await self.upload_assets(request_id, s3_config, result)
@@ -293,101 +301,91 @@ class PostprocessWorker:
         await loop.run_in_executor(None, os.symlink, str(target), str(link))
 
     async def upload_assets(self, request_id: str, s3_config: Dict, result) -> None:
-        """Upload assets to S3 storage"""
+        """Upload assets to Azure Blob Storage"""
         if not hasattr(result, 'output') or not result.output:
             logger.info(f"No assets to upload for {request_id}")
             return
             
+        container_client = None
         try:
-            session = aiobotocore.session.get_session()
+            # Get Azure Blob Storage configuration
+            connection_string = s3_config.get("endpoint_url")
+            container_name = s3_config.get("bucket_name")
             
-            # Build S3 client config
-            client_config = {
-                'aws_access_key_id': s3_config.get("access_key_id"),
-                'aws_secret_access_key': s3_config.get("secret_access_key"),
-            }
+            if not connection_string:
+                raise ValueError("Azure connection_string (endpoint_url) is required")
+            if not container_name:
+                raise ValueError("Azure container_name (bucket_name) is required")
             
-            if s3_config.get("endpoint_url"):
-                client_config['endpoint_url'] = s3_config["endpoint_url"]
-            
-            if s3_config.get("region"):
-                client_config['region_name'] = s3_config["region"]
-                
-            # Configure timeouts and retries
-            aio_config = aiobotocore.config.AioConfig(
-                connect_timeout=int(s3_config.get("connect_timeout", 60)),
-                retries={"max_attempts": int(s3_config.get("connect_attempts", 3))}
+            # Create a single ContainerClient for the batch
+            # This enables connection pooling and reduces overhead
+            container_client = ContainerClient.from_connection_string(
+                conn_str=connection_string,
+                container_name=container_name
             )
-            client_config['config'] = aio_config
             
-            async with session.create_client('s3', **client_config) as s3_client:
-                bucket_name = s3_config.get("bucket_name")
-                if not bucket_name:
-                    raise ValueError("S3 bucket_name is required")
-                
-                # Upload all files concurrently
-                tasks = []
-                for obj in result.output:
-                    local_path = obj.get("local_path")
-                    if local_path and Path(local_path).exists():
-                        task = asyncio.create_task(
-                            self.upload_file_and_get_url(
-                                request_id, s3_client, bucket_name, local_path
-                            )
+            # Upload all files concurrently using the shared client
+            tasks = []
+            for obj in result.output:
+                local_path = obj.get("local_path")
+                if local_path and Path(local_path).exists():
+                    task = asyncio.create_task(
+                        self.upload_file_and_get_url(
+                            request_id, container_client, local_path
                         )
-                        tasks.append(task)
-                    else:
-                        logger.warning(f"Local file not found: {local_path}")
-                        tasks.append(asyncio.create_task(self._return_none()))
+                    )
+                    tasks.append(task)
+                else:
+                    logger.warning(f"Local file not found: {local_path}")
+                    tasks.append(asyncio.create_task(self._return_none()))
+            
+            # Wait for all uploads
+            if tasks:
+                presigned_urls = await asyncio.gather(*tasks, return_exceptions=True)
                 
-                # Wait for all uploads
-                if tasks:
-                    presigned_urls = await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    # Update result objects with URLs
-                    for obj, url_result in zip(result.output, presigned_urls):
-                        if isinstance(url_result, Exception):
-                            logger.error(f"Upload failed for {obj.get('local_path')}: {url_result}")
-                            obj["upload_error"] = str(url_result)
-                        elif url_result:
-                            obj["url"] = url_result
-                            
-                    logger.info(f"Uploaded {len([u for u in presigned_urls if u and not isinstance(u, Exception)])} assets for {request_id}")
+                # Update result objects with URLs
+                for obj, url_result in zip(result.output, presigned_urls):
+                    if isinstance(url_result, Exception):
+                        logger.error(f"Upload failed for {obj.get('local_path')}: {url_result}")
+                        obj["upload_error"] = str(url_result)
+                    elif url_result:
+                        obj["url"] = url_result
+                        
+                logger.info(f"Uploaded {len([u for u in presigned_urls if u and not isinstance(u, Exception)])} assets for {request_id}")
                     
         except Exception as e:
             logger.error(f"Error uploading assets for {request_id}: {e}")
             raise
+        finally:
+            # Close the container client to release connections
+            if container_client:
+                await container_client.close()
 
     async def _return_none(self):
         """Helper for asyncio.gather with missing files"""
         return None
 
-    async def upload_file_and_get_url(self, request_id: str, s3_client, bucket_name: str, local_path: str) -> Optional[str]:
-        """Upload single file and return presigned URL"""
+    async def upload_file_and_get_url(self, request_id: str, container_client: ContainerClient, local_path: str) -> Optional[str]:
+        """Upload single file to Azure Blob Storage using streaming and return blob URL"""
         try:
             file_path = Path(local_path)
-            s3_key = f"{request_id}/{file_path.name}"
+            blob_name = f"{request_id}/{file_path.name}"
             
-            logger.debug(f"Uploading {s3_key} to bucket {bucket_name}")
+            logger.debug(f"Uploading {blob_name} to container (streaming)")
 
-            # Upload file
+            # Get blob client for this specific blob from the shared container client
+            blob_client = container_client.get_blob_client(blob_name)
+            
+            # Stream file directly without loading into memory
+            # The file object is passed directly to upload_blob which reads it in chunks
             async with aiofiles.open(local_path, 'rb') as file:
-                file_content = await file.read()
-                await s3_client.put_object(
-                    Bucket=bucket_name, 
-                    Key=s3_key, 
-                    Body=file_content
-                )
+                await blob_client.upload_blob(file, overwrite=True)
 
-            # Generate presigned URL
-            presigned_url = await s3_client.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': bucket_name, 'Key': s3_key},
-                ExpiresIn=604800  # 7 days
-            )
+            # Get the blob URL
+            blob_url = blob_client.url
             
-            logger.debug(f"Generated presigned URL for {s3_key}")
-            return presigned_url
+            logger.debug(f"Uploaded blob URL: {blob_url}")
+            return blob_url
             
         except Exception as e:
             logger.error(f"Error uploading {local_path}: {e}")
