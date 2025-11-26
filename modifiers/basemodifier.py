@@ -82,8 +82,9 @@ class BaseModifier:
 
     async def replace_workflow_urls(self, data):
         """
-        Find all URL strings in the prompt and replace the URL string with a filepath
+        Find all URL strings in the prompt and replace the URL string with a filepath unless url is openrouter.ai
         """
+
         if isinstance(data, dict):
             for key, value in data.items():
                 data[key] = await self.replace_workflow_urls(value)
@@ -92,6 +93,8 @@ class BaseModifier:
                 data[i] = await self.replace_workflow_urls(item)
         elif isinstance(data, str) and self.is_url(data):
             try:
+                if data.startswith("https://openrouter.ai"):
+                    return data
                 data = await self.get_url_content(data)
             except Exception as e:
                 logger.error(f"Failed to download URL {data}: {e}")
