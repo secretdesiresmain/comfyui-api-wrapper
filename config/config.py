@@ -52,6 +52,7 @@ S3_ENABLED = bool(
 # Webhook Configuration (fallback from environment)
 WEBHOOK_CONFIG = {
     "url": os.getenv("WEBHOOK_URL", ""),
+    "session-close-url": os.getenv("WEBHOOK_SESSION_CLOSE_URL", ""),
     "timeout": int(os.getenv("WEBHOOK_TIMEOUT", "30"))
 }
 

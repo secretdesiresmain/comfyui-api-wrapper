@@ -110,7 +110,13 @@ class PostprocessWorker:
                 webhook_config = await self.get_webhook_config(request.input)
                 if webhook_config:
                     try:
-                        await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}))
+                        # Send regular webhook if URL is provided
+                        if webhook_config.get('url'):
+                            await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}))
+                        
+                        # Send session-close webhook if URL is provided
+                        if webhook_config.get('session-close-url'):
+                            await self.send_webhook(webhook_config['session_close_url'], result, webhook_config.get('extra_params', {}))
                     except Exception as webhook_error:
                         # Will not mark a 'completed' job job as failed
                         logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
@@ -456,6 +462,7 @@ class PostprocessWorker:
                     logger.info("Using webhook config from payload")
                     return {
                         'url': input_data.webhook.url,
+                        'session-close-url': input_data.webhook.session_close_url,
                         'extra_params': input_data.webhook.extra_params,
                         'timeout': input_data.webhook.timeout
                     }
@@ -465,6 +472,7 @@ class PostprocessWorker:
                 logger.info("Using webhook config from environment variables")
                 return {
                     'url': WEBHOOK_CONFIG['url'],
+                    'session_close_url': WEBHOOK_CONFIG.get('session_close_url', ''),
                     'extra_params': {},
                     'timeout': WEBHOOK_CONFIG['timeout']
                 }

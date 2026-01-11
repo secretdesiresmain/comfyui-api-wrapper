@@ -50,6 +50,7 @@ class S3Config(BaseModel):
 
 class WebHook(BaseModel):
     url: str = Field(default="")
+    session_close_url: Optional[str] = Field(default="")
     extra_params: Dict = Field(default_factory=dict)
     timeout: int = Field(default=30)
     
@@ -57,6 +58,7 @@ class WebHook(BaseModel):
     def get_defaults():
         return {
             "url": "",
+            "session_close_url": "",
             "extra_params": {},
             "timeout": 30
         }
