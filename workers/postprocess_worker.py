@@ -460,12 +460,14 @@ class PostprocessWorker:
             if hasattr(input_data, 'webhook') and input_data.webhook:
                 if input_data.webhook.has_valid_url():
                     logger.info("Using webhook config from payload ")
-                    return {
+                    config_data = {
                         'url': input_data.webhook.url,
                         'session_close_url': input_data.webhook.session_close_url,
                         'extra_params': input_data.webhook.extra_params,
                         'timeout': input_data.webhook.timeout
                     }
+                    logger.info(f"Webhook config: {config_data}")
+                    return config_data
             
             # Fall back to centralized config (which reads from environment)
             if WEBHOOK_ENABLED:
