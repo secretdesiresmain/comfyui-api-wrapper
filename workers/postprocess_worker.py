@@ -459,10 +459,10 @@ class PostprocessWorker:
             # Check if webhook config provided in payload
             if hasattr(input_data, 'webhook') and input_data.webhook:
                 if input_data.webhook.has_valid_url():
-                    logger.info("Using webhook config from payload")
+                    logger.info("Using webhook config from payload ")
                     return {
                         'url': input_data.webhook.url,
-                        'session-close-url': input_data.webhook.session_close_url,
+                        'session_close_url': input_data.webhook.session_close_url,
                         'extra_params': input_data.webhook.extra_params,
                         'timeout': input_data.webhook.timeout
                     }
