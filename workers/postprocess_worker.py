@@ -115,7 +115,7 @@ class PostprocessWorker:
                             await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}))
                         
                         # Send session-close webhook if URL is provided
-                        if webhook_config.get('session-close-url'):
+                        if webhook_config.get('session_close_url'):
                             await self.send_webhook(webhook_config['session_close_url'], result, webhook_config.get('extra_params', {}))
                     except Exception as webhook_error:
                         # Will not mark a 'completed' job job as failed
