@@ -116,7 +116,11 @@ class PostprocessWorker:
                         
                         # Send session-close webhook if URL is provided
                         if webhook_config.get('session_close_url'):
-                            await self.send_webhook(webhook_config['session_close_url'], result, webhook_config.get('extra_params', {}))
+                            session_auth_data = webhook_config.get('session_auth_data')
+                            if session_auth_data is None:
+                                session_auth_data = {}
+                            logger.info(f"Sending session close webhook with session auth data: {session_auth_data}")
+                            await self.send_webhook_for_session_close(webhook_config['session_close_url'], result, session_auth_data)
                     except Exception as webhook_error:
                         # Will not mark a 'completed' job job as failed
                         logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
@@ -431,6 +435,42 @@ class PostprocessWorker:
             logger.error(f"Error sending webhook to {webhook_url}: {e}")
             # Don't raise - webhook failures shouldn't fail the whole job
 
+    
+    async def send_webhook_for_session_close(self, webhook_url: str, result, session_auth_data: Dict = None) -> None:
+        """Send webhook notification with result and session auth data"""
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            
+            # Prepare webhook payload
+            webhook_data = {
+                "id": result.id,
+                "status": result.status,
+                "message": result.message,
+                "output": getattr(result, 'output', [])
+            }
+            
+            # Add session auth data if provided
+            if session_auth_data:
+                webhook_data["session_auth"] = session_auth_data
+            
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    webhook_url,
+                    json=webhook_data,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        logger.warning(f"Session close webhook failed (status {response.status}): {error_text}")
+                    else:
+                        logger.info(f"Session close webhook sent successfully to {webhook_url}")
+                        
+        except Exception as e:
+            logger.error(f"Error sending session close webhook to {webhook_url}: {e}")
+            # Don't raise - webhook failures shouldn't fail the whole job
+
+    
+    
     async def get_s3_config(self, input_data) -> Optional[Dict]:
         """Get S3 configuration from payload or centralized config (from environment)"""
         try:
@@ -464,7 +504,8 @@ class PostprocessWorker:
                         'url': input_data.webhook.url,
                         'session_close_url': input_data.webhook.session_close_url,
                         'extra_params': input_data.webhook.extra_params,
-                        'timeout': input_data.webhook.timeout
+                        'timeout': input_data.webhook.timeout,
+                        'session_auth_data': getattr(input_data.webhook, 'session_auth_data', None)
                     }
                     logger.info(f"Webhook config: {config_data}")
                     return config_data
@@ -476,7 +517,8 @@ class PostprocessWorker:
                     'url': WEBHOOK_CONFIG['url'],
                     'session_close_url': WEBHOOK_CONFIG.get('session_close_url', ''),
                     'extra_params': {},
-                    'timeout': WEBHOOK_CONFIG['timeout']
+                    'timeout': WEBHOOK_CONFIG['timeout'],
+                    'session_auth_data': None
                 }
             
             # No valid config found
