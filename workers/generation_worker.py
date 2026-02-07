@@ -190,6 +190,7 @@ class GenerationWorker:
 
     async def post_workflow(self, request, request_id: str = None) -> str:
         """Submit workflow to ComfyUI API"""
+        logger.info(f"Posting workflow to ComfyUI API, with request : {request}", extra={"request_id": request_id})
         payload = {
             "prompt": request.input.workflow_json,
             "client_id": self.client_id  # Use our worker's client ID
@@ -348,7 +349,7 @@ class GenerationWorker:
                                         elif message_type == "executing":
                                             node = data.get("data", {}).get("node")
                                             if node:
-                                                logger.info(f"Executing node: {node}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id, "node": node})
+                                                logger.debug(f"Executing node: {node}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id, "node": node})
                                                 execution_result["nodes_executed"].append(node)
                                                 await self._update_progress(
                                                     request_id, 
@@ -368,7 +369,7 @@ class GenerationWorker:
                                             progress_pct = (value / max_value * 100) if max_value > 0 else 0
                                             progress_msg = f"Progress: {progress_pct:.1f}% ({value}/{max_value})"
                                             
-                                            logger.info(f"Progress update: {progress_msg}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                                            logger.debug(f"Progress update: {progress_msg}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                                             execution_result["progress_updates"].append({
                                                 "time": asyncio.get_event_loop().time() - start_time,
                                                 "value": value,
