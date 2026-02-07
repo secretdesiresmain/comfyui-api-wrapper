@@ -10,3 +10,5 @@ uvicorn[standard]>=0.24.0
 markdown
 python-dotenv>=1.0.0
 azure-storage-blob
+# Logging / Grafana Loki integration
+python-logging-loki>=0.3.1

@@ -79,6 +79,31 @@ REDIS_CONFIG = {
 # Development/Debug Configuration (actually used for debug output)
 DEBUG_ENABLED = os.getenv("DEBUG", "false").lower() == "true"
 
+# Logging Configuration
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = os.getenv("LOG_FORMAT", "text").lower()  # "text" or "json"
+
+# Loki Configuration (for Grafana log aggregation)
+# Supports direct Loki or Grafana Cloud
+LOKI_CONFIG = {
+    "enabled": os.getenv("LOKI_ENABLED", "false").lower() == "true",
+    "url": os.getenv("LOKI_URL", "http://localhost:3100/loki/api/v1/push"),
+    "username": os.getenv("LOKI_USERNAME", ""),
+    "password": os.getenv("LOKI_PASSWORD", ""),
+    "app_name": os.getenv("LOKI_APP_NAME", "comfyui-api-wrapper"),
+    "environment": os.getenv("LOKI_ENVIRONMENT", "development"),
+}
+
+# Grafana Cloud Configuration (takes precedence over LOKI_CONFIG if set)
+GRAFANA_CLOUD_CONFIG = {
+    "hostname": os.getenv("GRAFANA_HOSTNAME", ""),
+    "username": os.getenv("GRAFANA_USERNAME", ""),
+    "apikey": os.getenv("GRAFANA_APIKEY", ""),
+}
+
+# Check if Grafana Cloud is configured
+GRAFANA_CLOUD_ENABLED = bool(GRAFANA_CLOUD_CONFIG["hostname"])
+
 # Print configuration summary if debug enabled
 if DEBUG_ENABLED:
     print("🔧 Configuration Summary:")

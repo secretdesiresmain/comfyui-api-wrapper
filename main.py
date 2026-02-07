@@ -18,15 +18,16 @@ import time
 import aiofiles
 
 from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL
+from config.logging_config import setup_logging, get_logger, ErrorMetrics
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
 from workers.generation_worker import GenerationWorker
 from workers.postprocess_worker import PostprocessWorker
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG if DEBUG_ENABLED else logging.INFO)
-logger = logging.getLogger(__name__)
+# Configure structured logging with Loki support
+setup_logging(service_name="comfyui-api-wrapper")
+logger = get_logger(__name__)
 
 app = FastAPI(
     title="ComfyUI API Wrapper",
@@ -336,11 +337,11 @@ async def generate(
         await response_store.set(request_id, result_pending)
         await preprocess_queue.put(request_id)
         
-        logger.info(f"Queued request {request_id}")
+        logger.info(f"Queued request {request_id}", extra={"request_id": request_id})
         response.status_code = 202
         return result_pending
     except Exception as e:
-        logger.error(f"Failed to queue request {request_id}: {e}")
+        logger.error(f"Failed to queue request {request_id}: {e}", extra={"request_id": request_id})
         response.status_code = 500  # Internal Server Error
         failed_result = Result(
             id=request_id,
@@ -360,7 +361,7 @@ async def cancel_on_disconnect(request: Request, request_id: str):
                     message = await request.receive()
                     if message["type"] == "http.disconnect":
                         client = f'{request.client.host}:{request.client.port}' if request.client else '-:-'
-                        logger.info(f'{client} - "{request.method} {request.url.path}" 499 DISCONNECTED for {request_id}')
+                        logger.info(f'{client} - "{request.method} {request.url.path}" 499 DISCONNECTED for {request_id}', extra={"request_id": request_id})
                         await _mark_request_cancelled(request_id)
                         tg.cancel_scope.cancel()
                         break
@@ -394,7 +395,7 @@ async def generate_sync(
     await response_store.set(request_id, result_pending)
     await preprocess_queue.put(request_id)
 
-    logger.info(f"Queued synchronous request {request_id}")
+    logger.info(f"Queued synchronous request {request_id}", extra={"request_id": request_id})
 
     try:
         async with cancel_on_disconnect(request, request_id):
@@ -438,7 +439,7 @@ async def generate_stream(
         await response_store.set(request_id, result_pending)
         await preprocess_queue.put(request_id)
         
-        logger.info(f"Starting stream for request {request_id}")
+        logger.info(f"Starting stream for request {request_id}", extra={"request_id": request_id})
         
         # Return streaming response
         return StreamingResponse(
@@ -452,7 +453,7 @@ async def generate_stream(
         )
         
     except Exception as e:
-        logger.error(f"Failed to start stream for request {request_id}: {e}")
+        logger.error(f"Failed to start stream for request {request_id}: {e}", extra={"request_id": request_id})
         raise
 
 
@@ -468,9 +469,9 @@ async def _mark_request_cancelled(request_id: str):
                 result.status = "cancelled"
                 result.message = "Request cancelled due to client disconnection"
                 await response_store.set(request_id, result)
-                logger.info(f"Marked request {request_id} as cancelled")
+                logger.info(f"Marked request {request_id} as cancelled", extra={"request_id": request_id})
             else:
-                logger.debug(f"Request {request_id} already in terminal state: {result.status}")
+                logger.debug(f"Request {request_id} already in terminal state: {result.status}", extra={"request_id": request_id})
         else:
             # Create a new cancelled result if none exists
             cancelled_result = Result(
@@ -479,10 +480,10 @@ async def _mark_request_cancelled(request_id: str):
                 message="Request cancelled due to client disconnection"
             )
             await response_store.set(request_id, cancelled_result)
-            logger.info(f"Created cancelled result for request {request_id}")
+            logger.info(f"Created cancelled result for request {request_id}", extra={"request_id": request_id})
             
     except Exception as e:
-        logger.error(f"Failed to mark request {request_id} as cancelled: {e}")
+        logger.error(f"Failed to mark request {request_id} as cancelled: {e}", extra={"request_id": request_id})
 
 async def _stream_status_updates(request_id: str):
     """Generator that yields Server-Sent Events for status updates using worker progress"""
@@ -612,7 +613,7 @@ def _get_queue_position(request_id: str) -> dict:
         })
         
     except Exception as e:
-        logger.debug(f"Error getting queue position for {request_id}: {e}")
+        logger.debug(f"Error getting queue position for {request_id}: {e}", extra={"request_id": request_id})
         position_info.update({
             "current_queue": "unknown",
             "position": 0,
@@ -669,7 +670,7 @@ async def result(request_id: str, response: Response):
         
         return result
     except Exception as e:
-        logger.error(f"Failed to get result for {request_id}: {e}")
+        logger.error(f"Failed to get result for {request_id}: {e}", extra={"request_id": request_id})
         result = Result(id=request_id, status="failed", message="Internal server error")
         response.status_code = 500
         return result
@@ -700,7 +701,7 @@ async def cancel_request_simple(
         result.message = "Request cancelled by client"
         await response_store.set(request_id, result)
         
-        logger.info(f"Cancelled request {request_id}")
+        logger.info(f"Cancelled request {request_id}", extra={"request_id": request_id})
         
         return {
             "message": f"Successfully cancelled request {request_id}",
@@ -708,7 +709,7 @@ async def cancel_request_simple(
         }
         
     except Exception as e:
-        logger.error(f"Failed to cancel request {request_id}: {e}")
+        logger.error(f"Failed to cancel request {request_id}: {e}", extra={"request_id": request_id})
         response.status_code = 500
 
 @app.get('/queue-info', response_model=dict)

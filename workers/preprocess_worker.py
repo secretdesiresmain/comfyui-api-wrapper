@@ -1,9 +1,10 @@
 # preprocess_worker
 import importlib
-import logging
+import time
 from modifiers.basemodifier import BaseModifier
+from config.logging_config import get_logger, ErrorMetrics
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class PreprocessWorker:
@@ -19,7 +20,10 @@ class PreprocessWorker:
         self.response_store = kwargs["response_store"]
 
     async def work(self):
-        logger.info(f"PreprocessWorker {self.worker_id}: waiting for jobs")
+        logger.info(
+            "Worker starting",
+            extra={"worker_id": self.worker_id, "worker_type": "preprocess"}
+        )
         while True:
             # Get a task from the job queue
             request_id = await self.preprocess_queue.get()
@@ -28,7 +32,16 @@ class PreprocessWorker:
                 break
 
             # Process the job
-            logger.info(f"PreprocessWorker {self.worker_id} processing job: {request_id}")
+            start_time = time.time()
+            logger.info(
+                f"Processing job: {request_id}",
+                extra={
+                    "worker_id": self.worker_id,
+                    "worker_type": "preprocess",
+                    "request_id": request_id,
+                    "stage": "preprocess_start"
+                }
+            )
             
             try:
                 # Get request and result from stores
@@ -42,7 +55,14 @@ class PreprocessWorker:
 
                 # Check for cancellation
                 if result and getattr(result, 'status', '') == 'cancelled':
-                    logger.info(f"PreprocessWorker {self.worker_id} skipping cancelled job: {request_id} - jumping to postprocess")
+                    logger.info(
+                        f"Skipping cancelled job: {request_id}",
+                        extra={
+                            "worker_id": self.worker_id,
+                            "request_id": request_id,
+                            "status": "cancelled"
+                        }
+                    )
                     await self.postprocess_queue.put(request_id)
                     self.preprocess_queue.task_done()
                     continue
@@ -50,7 +70,8 @@ class PreprocessWorker:
                 # Get and initialize the workflow modifier
                 modifier = await self.get_workflow_modifier(
                     request.input.modifier, 
-                    request.input.modifications
+                    request.input.modifications,
+                    request_id
                 )
                 
                 # Load and modify the workflow
@@ -67,10 +88,22 @@ class PreprocessWorker:
                 
                 # Send for ComfyUI generation
                 await self.generation_queue.put(request_id)
-                logger.info(f"PreprocessWorker {self.worker_id} completed job: {request_id}")
+                
+                # Log timing
+                duration_ms = (time.time() - start_time) * 1000
+                ErrorMetrics.log_request_timing(
+                    logger, request_id, "preprocess", duration_ms, "success",
+                    worker_id=self.worker_id, modifier=request.input.modifier or "BaseModifier"
+                )
                 
             except Exception as e:
-                logger.error(f"PreprocessWorker {self.worker_id} failed job {request_id}: {e}")
+                duration_ms = (time.time() - start_time) * 1000
+                ErrorMetrics.log_error(
+                    logger, e, "preprocessing",
+                    request_id=request_id,
+                    worker_id=self.worker_id,
+                    duration_ms=duration_ms
+                )
                 
                 try:
                     # Update result to show failure
@@ -84,15 +117,22 @@ class PreprocessWorker:
                     await self.postprocess_queue.put(request_id)
                     
                 except Exception as store_error:
-                    logger.error(f"Failed to update result store for {request_id}: {store_error}")
+                    ErrorMetrics.log_error(
+                        logger, store_error, "store_update",
+                        request_id=request_id,
+                        worker_id=self.worker_id
+                    )
             
             finally:
                 # Mark the job as complete
                 self.preprocess_queue.task_done()
             
-        logger.info(f"PreprocessWorker {self.worker_id} finished")
+        logger.info(
+            "Worker finished",
+            extra={"worker_id": self.worker_id, "worker_type": "preprocess"}
+        )
 
-    async def get_workflow_modifier(self, modifier_name: str, modifications: dict) -> BaseModifier:
+    async def get_workflow_modifier(self, modifier_name: str, modifications: dict, request_id: str = None) -> BaseModifier:
         """Get the appropriate workflow modifier class"""
         try:
             if modifier_name:
@@ -100,20 +140,20 @@ class PreprocessWorker:
                 module_name = f'modifiers.{modifier_name.lower()}'
                 module = importlib.import_module(module_name)
                 modifier_class = getattr(module, modifier_name)
-                logger.info(f"Using modifier: {modifier_name}")
+                logger.info(f"Using modifier: {modifier_name}", extra={"request_id": request_id, "modifier": modifier_name})
             else:
                 # Use base modifier if no specific modifier specified
                 modifier_class = BaseModifier
-                logger.info("Using BaseModifier")
+                logger.info("Using BaseModifier", extra={"request_id": request_id, "modifier": "BaseModifier"})
                 
             return modifier_class(modifications)
             
         except ImportError as e:
-            logger.error(f"Failed to import modifier '{modifier_name}': {e}")
+            logger.error(f"Failed to import modifier '{modifier_name}': {e}", extra={"request_id": request_id, "modifier": modifier_name})
             raise Exception(f"Unknown modifier: {modifier_name}")
         except AttributeError as e:
-            logger.error(f"Modifier class '{modifier_name}' not found in module: {e}")
+            logger.error(f"Modifier class '{modifier_name}' not found in module: {e}", extra={"request_id": request_id, "modifier": modifier_name})
             raise Exception(f"Modifier class '{modifier_name}' not found")
         except Exception as e:
-            logger.error(f"Failed to create modifier '{modifier_name}': {e}")
+            logger.error(f"Failed to create modifier '{modifier_name}': {e}", extra={"request_id": request_id, "modifier": modifier_name})
             raise
