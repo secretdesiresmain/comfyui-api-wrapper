@@ -17,7 +17,8 @@ from aiocache import Cache, SimpleMemoryCache
 import time
 import aiofiles
 
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL
+import aiohttp
+from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
@@ -722,14 +723,35 @@ async def queue_info():
 
 
 @app.get('/health', response_model=dict)
-async def health():
-    """Health check endpoint"""
-    return {
+async def health(response: Response):
+    """Health check endpoint - returns healthy only if ComfyUI system stats is accessible"""
+    health_response = {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
         "queues": {
             "preprocess": preprocess_queue.qsize(),
-            "generation": generation_queue.qsize(), 
+            "generation": generation_queue.qsize(),
             "postprocess": postprocess_queue.qsize(),
         }
     }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
+                if stats_response.status != 200:
+                    health_response["status"] = "unhealthy"
+                    health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
+                    response.status_code = 502
+                else:
+                    health_response["comfyui_system_stats"] = await stats_response.json()
+    except aiohttp.ClientError as e:
+        health_response["status"] = "unhealthy"
+        health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
+        response.status_code = 502
+    except Exception as e:
+        health_response["status"] = "unhealthy"
+        health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
+        response.status_code = 502
+
+    return health_response
