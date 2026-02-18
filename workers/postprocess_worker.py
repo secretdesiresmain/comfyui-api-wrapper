@@ -1,8 +1,8 @@
 # postprocess_worker
 import asyncio
-import logging
 import os  # Still needed for symlink and remove operations
 import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
@@ -15,8 +15,9 @@ import aiohttp
 from azure.storage.blob.aio import ContainerClient
 
 from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
+from config.logging_config import get_logger, ErrorMetrics
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 #map of s3 field names to blob storage field names
@@ -41,7 +42,10 @@ class PostprocessWorker:
         self.output_dir = Path(OUTPUT_DIR)
 
     async def work(self):
-        logger.info(f"PostprocessWorker {self.worker_id}: waiting for jobs")
+        logger.info(
+            "Worker starting",
+            extra={"worker_id": self.worker_id, "worker_type": "postprocess"}
+        )
         while True:
             # Get a task from the job queue
             request_id = await self.postprocess_queue.get()
@@ -50,7 +54,20 @@ class PostprocessWorker:
                 break
 
             # Process the job
-            logger.info(f"PostprocessWorker {self.worker_id} processing job: {request_id}")
+            start_time = time.time()
+            s3_uploaded = False
+            webhook_sent = False
+            output_count = 0
+            
+            logger.info(
+                f"Processing job: {request_id}",
+                extra={
+                    "worker_id": self.worker_id,
+                    "worker_type": "postprocess",
+                    "request_id": request_id,
+                    "stage": "postprocess_start"
+                }
+            )
             
             try:
                 # Get request and result from stores
@@ -64,35 +81,69 @@ class PostprocessWorker:
                 
                 # Only process if we have ComfyUI output (successful generation)
                 if hasattr(result, 'comfyui_response') and result.comfyui_response:
-                    logger.info(f"Processing outputs for {request_id}")
-                    logger.debug(f"ComfyUI response structure: {json.dumps(result.comfyui_response, indent=2)[:1000]}")
+                    logger.info(
+                        f"Processing outputs for {request_id}",
+                        extra={"request_id": request_id, "has_output": True}
+                    )
+                    logger.info(
+                        f"ComfyUI response structure: {json.dumps(result.comfyui_response, indent=2)[:1000]}",
+                        extra={"request_id": request_id}
+                    )
                     
                     # Move generated assets to organized directory
                     await self.move_assets(request_id, result)
+                    output_count = len(getattr(result, 'output', []))
                     
-                    # Handle S3 upload - check payload first, then environment variables, we are using s3 field names to support base container
-                    s3_config = await self.get_s3_config(request.input)
+                    # Handle S3 upload - check payload first, then environment variables
+                    s3_config = await self.get_s3_config(request.input, request_id)
                     if s3_config:
                         await self.upload_assets(request_id, s3_config, result)
+                        s3_uploaded = True
                     else:
-                        logger.info(f"No S3 configuration found for {request_id}, skipping upload")
+                        logger.info(
+                            f"No S3 configuration found, skipping upload",
+                            extra={"request_id": request_id}
+                        )
                 else:
-                    logger.info(f"No ComfyUI output for {request_id}, likely a failed job")
+                    logger.info(
+                        f"No ComfyUI output, likely a failed job",
+                        extra={"request_id": request_id, "has_output": False}
+                    )
                     if hasattr(result, 'comfyui_response'):
-                        logger.debug(f"ComfyUI response was: {result.comfyui_response}")
+                        logger.info(
+                            f"ComfyUI response was: {result.comfyui_response}",
+                            extra={"request_id": request_id}
+                        )
 
                 # Update final status only if not already failed
                 if result.status != "failed":
                     result.status = "completed"
                     result.message = "Processing complete."
                 else:
-                    logger.info(f"Job {request_id} already marked as failed, keeping failure status")
+                    logger.info(
+                        f"Job already marked as failed, keeping failure status",
+                        extra={"request_id": request_id, "status": result.status}
+                    )
                 
                 await self.response_store.set(request_id, result)
-                logger.info(f"PostprocessWorker {self.worker_id} completed job: {request_id}")
+                
+                # Log timing
+                duration_ms = (time.time() - start_time) * 1000
+                ErrorMetrics.log_request_timing(
+                    logger, request_id, "postprocess", duration_ms, "success",
+                    worker_id=self.worker_id,
+                    output_count=output_count,
+                    s3_uploaded=s3_uploaded
+                )
                 
             except Exception as e:
-                logger.error(f"PostprocessWorker {self.worker_id} failed job {request_id}: {e}")
+                duration_ms = (time.time() - start_time) * 1000
+                ErrorMetrics.log_error(
+                    logger, e, "postprocessing",
+                    request_id=request_id,
+                    worker_id=self.worker_id,
+                    duration_ms=duration_ms
+                )
                 
                 try:
                     # Update result to show failure
@@ -103,29 +154,67 @@ class PostprocessWorker:
                         await self.response_store.set(request_id, result)
                     
                 except Exception as store_error:
-                    logger.error(f"Failed to update result store for {request_id}: {store_error}")
+                    ErrorMetrics.log_error(
+                        logger, store_error, "store_update",
+                        request_id=request_id,
+                        worker_id=self.worker_id
+                    )
             
             finally:
                 # Handle webhook - check payload first, then environment variables
-                webhook_config = await self.get_webhook_config(request.input)
+                webhook_config = await self.get_webhook_config(request.input, request_id)
                 if webhook_config:
                     try:
-                        await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}))
+                        # Send regular webhook if URL is provided
+                        if webhook_config.get('url'):
+                            await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}), request_id)
+                            webhook_sent = True
+                        
+                        # Send session-close webhook if URL is provided
+                        if webhook_config.get('session_close_url'):
+                            session_auth_data = webhook_config.get('session_auth_data')
+                            if session_auth_data is None:
+                                session_auth_data = {}
+                            logger.info(
+                                f"Sending session close webhook",
+                                extra={
+                                    "request_id": request_id,
+                                    "session_close_url": webhook_config['session_close_url']
+                                }
+                            )
+                            await self.send_webhook_for_session_close(webhook_config['session_close_url'], result, session_auth_data, request_id)
                     except Exception as webhook_error:
-                        # Will not mark a 'completed' job job as failed
-                        logger.error(f"Failed to run webhook for {request_id}: {webhook_error}")
+                        # Will not mark a 'completed' job as failed
+                        ErrorMetrics.log_error(
+                            logger, webhook_error, "webhook",
+                            request_id=request_id,
+                            worker_id=self.worker_id,
+                            webhook_url=webhook_config.get('url', '')
+                        )
                 else:
-                    logger.info(f"No webhook configuration found for {request_id}")
+                    logger.info(
+                        f"No webhook configuration found",
+                        extra={"request_id": request_id}
+                    )
                 # Clean up the request store
                 try:
                     await self.request_store.delete(request_id)
-                    logger.debug(f"Cleaned up request for {request_id}")
+                    logger.info(
+                        f"Cleaned up request",
+                        extra={"request_id": request_id}
+                    )
                 except Exception as e:
-                    logger.warning(f"Failed to clean up request for {request_id}: {e}")
+                    logger.warning(
+                        f"Failed to clean up request: {e}",
+                        extra={"request_id": request_id}
+                    )
                 # Mark the job as complete
                 self.postprocess_queue.task_done()
             
-        logger.info(f"PostprocessWorker {self.worker_id} finished")
+        logger.info(
+            "Worker finished",
+            extra={"worker_id": self.worker_id, "worker_type": "postprocess"}
+        )
     
     async def move_assets(self, request_id: str, result) -> None:
         """Move generated assets to organized directory structure"""
@@ -161,32 +250,32 @@ class PostprocessWorker:
                 for prompt_id, prompt_data in result.comfyui_response.items():
                     if isinstance(prompt_data, dict) and 'outputs' in prompt_data:
                         outputs = prompt_data['outputs']
-                        logger.debug(f"Found outputs under prompt_id {prompt_id}")
+                        logger.debug(f"Found outputs under prompt_id {prompt_id}", extra={"request_id": request_id})
                         break
                     elif isinstance(prompt_data, dict):
                         # Sometimes outputs might be directly in the prompt_data
-                        logger.debug(f"Checking if prompt_data contains output nodes directly")
+                        logger.debug(f"Checking if prompt_data contains output nodes directly", extra={"request_id": request_id})
                         outputs = prompt_data
                         break
             
             if not outputs:
-                logger.warning(f"No outputs found in ComfyUI response for {request_id}")
-                logger.debug(f"Full response structure: {json.dumps(result.comfyui_response, indent=2)[:2000]}")
+                logger.warning(f"No outputs found in ComfyUI response for {request_id}", extra={"request_id": request_id})
+                logger.debug(f"Full response structure: {json.dumps(result.comfyui_response, indent=2)[:2000]}", extra={"request_id": request_id})
                 return
             
             # Process each node's outputs
             processed_files = []
             for node_id, node_outputs in outputs.items():
                 if not isinstance(node_outputs, dict):
-                    logger.debug(f"Skipping non-dict node output: {node_id}")
+                    logger.debug(f"Skipping non-dict node output: {node_id}", extra={"request_id": request_id})
                     continue
                 
-                logger.debug(f"Processing node {node_id} outputs: {list(node_outputs.keys())}")
+                logger.debug(f"Processing node {node_id} outputs: {list(node_outputs.keys())}", extra={"request_id": request_id})
                 
                 # Look for different output types (images, gifs, videos, etc.)
                 for output_type, output_list in node_outputs.items():
                     if not isinstance(output_list, list):
-                        logger.debug(f"Skipping non-list output type {output_type} in node {node_id}")
+                        logger.debug(f"Skipping non-list output type {output_type} in node {node_id}", extra={"request_id": request_id})
                         continue
                     
                     for item in output_list:
@@ -194,7 +283,7 @@ class PostprocessWorker:
                             # Skip preview/temp files
                             file_type = item.get('type', '')
                             if file_type in ['temp', 'preview']:
-                                logger.debug(f"Skipping {file_type} file: {item.get('filename')}")
+                                logger.debug(f"Skipping {file_type} file: {item.get('filename')}", extra={"request_id": request_id})
                                 continue
                             
                             # Process this output file
@@ -210,10 +299,10 @@ class PostprocessWorker:
             
             # Add all processed files to the result
             result.output = processed_files
-            logger.info(f"Processed {len(processed_files)} output files for {request_id}")
+            logger.info(f"Processed {len(processed_files)} output files for {request_id}", extra={"request_id": request_id})
             
         except Exception as e:
-            logger.error(f"Error moving assets for {request_id}: {e}", exc_info=True)
+            logger.error(f"Error moving assets for {request_id}: {e}", extra={"request_id": request_id}, exc_info=True)
             raise
 
     async def _process_output_file(self, item: Dict, job_output_dir: Path, request_id: str, node_id: str, output_type: str) -> Optional[Dict]:
@@ -224,7 +313,7 @@ class PostprocessWorker:
             file_type = item.get('type', 'output')
             
             if not filename:
-                logger.warning(f"No filename in output item: {item}")
+                logger.warning(f"No filename in output item: {item}", extra={"request_id": request_id})
                 return None
             
             # Construct the original file path
@@ -236,12 +325,12 @@ class PostprocessWorker:
             
             # Check if the file exists
             if not original_path.exists():
-                logger.warning(f"Original file not found: {original_path}")
+                logger.warning(f"Original file not found: {original_path}", extra={"request_id": request_id})
                 # Try without subfolder as fallback
                 if subfolder:
                     fallback_path = self.output_dir / filename
                     if fallback_path.exists():
-                        logger.info(f"Found file at fallback location: {fallback_path}")
+                        logger.info(f"Found file at fallback location: {fallback_path}", extra={"request_id": request_id})
                         original_path = fallback_path
                     else:
                         return None
@@ -254,7 +343,7 @@ class PostprocessWorker:
             # Get the real path (in case original_path is a symlink from a cached result)
             real_original_path = original_path.resolve()
             
-            logger.info(f"Copying {real_original_path} to {dest_path}")
+            logger.info(f"Copying {real_original_path} to {dest_path}", extra={"request_id": request_id})
             
             # Copy the file (using real path to handle symlinks)
             await self._copy_file_async(real_original_path, dest_path)
@@ -266,7 +355,7 @@ class PostprocessWorker:
             # Create symlink from original location to our copy
             await self._create_symlink_async(dest_path, original_path)
             
-            logger.debug(f"Created symlink: {original_path} -> {dest_path}")
+            logger.debug(f"Created symlink: {original_path} -> {dest_path}", extra={"request_id": request_id})
             
             # Return file info for result
             return {
@@ -279,7 +368,7 @@ class PostprocessWorker:
             }
             
         except Exception as e:
-            logger.error(f"Error processing output file {item}: {e}", exc_info=True)
+            logger.error(f"Error processing output file {item}: {e}", extra={"request_id": request_id}, exc_info=True)
             return None
 
     async def _copy_file_async(self, src: Path, dst: Path) -> None:
@@ -303,7 +392,7 @@ class PostprocessWorker:
     async def upload_assets(self, request_id: str, s3_config: Dict, result) -> None:
         """Upload assets to Azure Blob Storage"""
         if not hasattr(result, 'output') or not result.output:
-            logger.info(f"No assets to upload for {request_id}")
+            logger.info(f"No assets to upload for {request_id}", extra={"request_id": request_id})
             return
             
         container_client = None
@@ -336,7 +425,7 @@ class PostprocessWorker:
                     )
                     tasks.append(task)
                 else:
-                    logger.warning(f"Local file not found: {local_path}")
+                    logger.warning(f"Local file not found: {local_path}", extra={"request_id": request_id})
                     tasks.append(asyncio.create_task(self._return_none()))
             
             # Wait for all uploads
@@ -346,15 +435,15 @@ class PostprocessWorker:
                 # Update result objects with URLs
                 for obj, url_result in zip(result.output, presigned_urls):
                     if isinstance(url_result, Exception):
-                        logger.error(f"Upload failed for {obj.get('local_path')}: {url_result}")
+                        logger.error(f"Upload failed for {obj.get('local_path')}: {url_result}", extra={"request_id": request_id})
                         obj["upload_error"] = str(url_result)
                     elif url_result:
                         obj["url"] = url_result
                         
-                logger.info(f"Uploaded {len([u for u in presigned_urls if u and not isinstance(u, Exception)])} assets for {request_id}")
+                logger.info(f"Uploaded {len([u for u in presigned_urls if u and not isinstance(u, Exception)])} assets for {request_id}", extra={"request_id": request_id})
                     
         except Exception as e:
-            logger.error(f"Error uploading assets for {request_id}: {e}")
+            logger.error(f"Error uploading assets for {request_id}: {e}", extra={"request_id": request_id})
             raise
         finally:
             # Close the container client to release connections
@@ -372,7 +461,7 @@ class PostprocessWorker:
             extension = file_path.suffix
             blob_name = f"{request_id}{extension}"
             
-            logger.debug(f"Uploading {blob_name} to container (streaming)")
+            logger.debug(f"Uploading {blob_name} to container (streaming)", extra={"request_id": request_id})
 
             # Get blob client for this specific blob from the shared container client
             blob_client = container_client.get_blob_client(blob_name)
@@ -385,14 +474,14 @@ class PostprocessWorker:
             # Get the blob URL
             blob_url = blob_client.url
             
-            logger.debug(f"Uploaded blob URL: {blob_url}")
+            logger.debug(f"Uploaded blob URL: {blob_url}", extra={"request_id": request_id})
             return blob_url
             
         except Exception as e:
-            logger.error(f"Error uploading {local_path}: {e}")
+            logger.error(f"Error uploading {local_path}: {e}", extra={"request_id": request_id})
             raise
 
-    async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None) -> None:
+    async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None, request_id: str = None) -> None:
         """Send webhook notification with result"""
         try:
             timeout = aiohttp.ClientTimeout(total=30)
@@ -417,62 +506,104 @@ class PostprocessWorker:
                 ) as response:
                     if response.status >= 400:
                         error_text = await response.text()
-                        logger.warning(f"Webhook failed (status {response.status}): {error_text}")
+                        logger.warning(f"Webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
                     else:
-                        logger.info(f"Webhook sent successfully to {webhook_url}")
+                        logger.info(f"Webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
                         
         except Exception as e:
-            logger.error(f"Error sending webhook to {webhook_url}: {e}")
+            logger.error(f"Error sending webhook to {webhook_url}: {e}", extra={"request_id": request_id})
             # Don't raise - webhook failures shouldn't fail the whole job
 
-    async def get_s3_config(self, input_data) -> Optional[Dict]:
+    
+    async def send_webhook_for_session_close(self, webhook_url: str, result, session_auth_data: Dict = None, request_id: str = None) -> None:
+        """Send webhook notification with result and session auth data"""
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            
+            # Prepare webhook payload
+            webhook_data = {
+                "id": result.id,
+                "status": result.status,
+                "message": result.message,
+                "output": getattr(result, 'output', [])
+            }
+            
+            # Add session auth data if provided
+            if session_auth_data:
+                webhook_data["session_auth"] = session_auth_data
+            
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    webhook_url,
+                    json=webhook_data,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        logger.warning(f"Session close webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
+                    else:
+                        logger.info(f"Session close webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
+                        
+        except Exception as e:
+            logger.error(f"Error sending session close webhook to {webhook_url}: {e}", extra={"request_id": request_id})
+            # Don't raise - webhook failures shouldn't fail the whole job
+
+    
+    
+    async def get_s3_config(self, input_data, request_id: str = None) -> Optional[Dict]:
         """Get S3 configuration from payload or centralized config (from environment)"""
         try:
             # Check if S3 config provided in payload
             if hasattr(input_data, 's3') and input_data.s3:
                 if input_data.s3.is_configured():
-                    logger.info("Using S3 config from payload")
+                    logger.info("Using S3 config from payload", extra={"request_id": request_id})
                     return input_data.s3.get_config()
             
             # Fall back to centralized config (which reads from environment)
             if S3_ENABLED:
-                logger.info("Using S3 config from environment variables")
+                logger.info("Using S3 config from environment variables", extra={"request_id": request_id})
                 return S3_CONFIG.copy()  # Return a copy to avoid mutation
             
             # No valid config found
-            logger.debug("No S3 configuration available")
+            logger.debug("No S3 configuration available", extra={"request_id": request_id})
             return None
             
         except Exception as e:
-            logger.error(f"Error getting S3 config: {e}")
+            logger.error(f"Error getting S3 config: {e}", extra={"request_id": request_id})
             return None
 
-    async def get_webhook_config(self, input_data) -> Optional[Dict]:
+    async def get_webhook_config(self, input_data, request_id: str = None) -> Optional[Dict]:
         """Get webhook configuration from payload or centralized config (from environment)"""
         try:
             # Check if webhook config provided in payload
             if hasattr(input_data, 'webhook') and input_data.webhook:
                 if input_data.webhook.has_valid_url():
-                    logger.info("Using webhook config from payload")
-                    return {
+                    logger.info("Using webhook config from payload", extra={"request_id": request_id})
+                    config_data = {
                         'url': input_data.webhook.url,
+                        'session_close_url': input_data.webhook.session_close_url,
                         'extra_params': input_data.webhook.extra_params,
-                        'timeout': input_data.webhook.timeout
+                        'timeout': input_data.webhook.timeout,
+                        'session_auth_data': getattr(input_data.webhook, 'session_auth_data', None)
                     }
+                    logger.info(f"Webhook config: {config_data}", extra={"request_id": request_id})
+                    return config_data
             
             # Fall back to centralized config (which reads from environment)
             if WEBHOOK_ENABLED:
-                logger.info("Using webhook config from environment variables")
+                logger.info("Using webhook config from environment variables", extra={"request_id": request_id})
                 return {
                     'url': WEBHOOK_CONFIG['url'],
+                    'session_close_url': WEBHOOK_CONFIG.get('session_close_url', ''),
                     'extra_params': {},
-                    'timeout': WEBHOOK_CONFIG['timeout']
+                    'timeout': WEBHOOK_CONFIG['timeout'],
+                    'session_auth_data': None
                 }
             
             # No valid config found
-            logger.debug("No webhook configuration available")
+            logger.debug("No webhook configuration available", extra={"request_id": request_id})
             return None
             
         except Exception as e:
-            logger.error(f"Error getting webhook config: {e}")
+            logger.error(f"Error getting webhook config: {e}", extra={"request_id": request_id})
             return None
