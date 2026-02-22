@@ -69,14 +69,6 @@ preprocess_queue = asyncio.Queue()
 generation_queue = asyncio.Queue()
 postprocess_queue = asyncio.Queue()
 
-# Active job tracking for health check
-active_job_count = 0
-_last_job_submitted_at: float = 0
-_completed_job_ids: set = set()
-_comfyui_unhealthy_since: float = 0
-COMFYUI_UNHEALTHY_GRACE_PERIOD = 120  # seconds to tolerate ComfyUI unresponsiveness during active jobs
-_DRIFT_TIMEOUT = 600  # if last submission was >10min ago, assume counter drifted
-
 
 @app.on_event("startup")
 async def startup_event():
@@ -339,20 +331,18 @@ async def generate(
     
     result_pending = Result(id=request_id)
 
-    global active_job_count, _last_job_submitted_at
     try:
+        # Store request and initial result
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
         await preprocess_queue.put(request_id)
-        active_job_count += 1
-        _last_job_submitted_at = time.time()
         
-        logger.info(f"Queued request {request_id} (active_jobs={active_job_count})")
+        logger.info(f"Queued request {request_id}")
         response.status_code = 202
         return result_pending
     except Exception as e:
         logger.error(f"Failed to queue request {request_id}: {e}")
-        response.status_code = 500
+        response.status_code = 500  # Internal Server Error
         failed_result = Result(
             id=request_id,
             status="failed",
@@ -400,22 +390,18 @@ async def generate_sync(
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
 
-    global active_job_count, _last_job_submitted_at
     result_pending = Result(id=request_id)
     await request_store.set(request_id, payload)
     await response_store.set(request_id, result_pending)
     await preprocess_queue.put(request_id)
-    active_job_count += 1
-    _last_job_submitted_at = time.time()
 
-    logger.info(f"Queued synchronous request {request_id} (active_jobs={active_job_count})")
+    logger.info(f"Queued synchronous request {request_id}")
 
     try:
         async with cancel_on_disconnect(request, request_id):
             while True:
                 result = await response_store.get(request_id)
                 if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
-                    active_job_count = max(0, active_job_count - 1)
                     return result
                 await asyncio.sleep(0.5)
 
@@ -447,15 +433,13 @@ async def generate_stream(
     
     result_pending = Result(id=request_id)
 
-    global active_job_count, _last_job_submitted_at
     try:
+        # Store request and initial result
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
         await preprocess_queue.put(request_id)
-        active_job_count += 1
-        _last_job_submitted_at = time.time()
         
-        logger.info(f"Starting stream for request {request_id} (active_jobs={active_job_count})")
+        logger.info(f"Starting stream for request {request_id}")
         
         # Return streaming response
         return StreamingResponse(
@@ -477,27 +461,26 @@ async def generate_stream(
 
 async def _mark_request_cancelled(request_id: str):
     """Helper to mark a request as cancelled in the response store"""
-    global active_job_count
     try:
         result = await response_store.get(request_id)
         if result:
+            # Only update if not already in a terminal state
             if result.status not in ['completed', 'failed', 'timeout', 'cancelled']:
                 result.status = "cancelled"
                 result.message = "Request cancelled due to client disconnection"
                 await response_store.set(request_id, result)
-                active_job_count = max(0, active_job_count - 1)
-                logger.info(f"Marked request {request_id} as cancelled (active_jobs={active_job_count})")
+                logger.info(f"Marked request {request_id} as cancelled")
             else:
                 logger.debug(f"Request {request_id} already in terminal state: {result.status}")
         else:
+            # Create a new cancelled result if none exists
             cancelled_result = Result(
                 id=request_id,
                 status="cancelled",
                 message="Request cancelled due to client disconnection"
             )
             await response_store.set(request_id, cancelled_result)
-            active_job_count = max(0, active_job_count - 1)
-            logger.info(f"Created cancelled result for request {request_id} (active_jobs={active_job_count})")
+            logger.info(f"Created cancelled result for request {request_id}")
             
     except Exception as e:
         logger.error(f"Failed to mark request {request_id} as cancelled: {e}")
@@ -549,10 +532,10 @@ async def _stream_status_updates(request_id: str):
                 last_result = current_result
                 last_queue_position = queue_position
             
+            # Check if processing is complete
             if current_result and hasattr(current_result, 'status'):
                 if current_result.status in ['completed', 'failed', 'timeout']:
-                    global active_job_count
-                    active_job_count = max(0, active_job_count - 1)
+                    # Send final result
                     final_data = {
                         "request_id": request_id,
                         "status": "final_result",
@@ -679,18 +662,11 @@ def _serialize_result(result) -> dict:
 @app.get('/result/{request_id}', response_model=Result, status_code=200)
 async def result(request_id: str, response: Response):
     """Get the result of a processing request"""
-    global active_job_count
     try:
         result = await response_store.get(request_id)
         if not result:
             result = Result(id=request_id, status="failed", message="Request ID not found")
             response.status_code = 404
-        elif result.status in ['completed', 'failed', 'timeout', 'cancelled']:
-            if request_id not in _completed_job_ids:
-                _completed_job_ids.add(request_id)
-                active_job_count = max(0, active_job_count - 1)
-                if len(_completed_job_ids) > 1000:
-                    _completed_job_ids.clear()
         
         return result
     except Exception as e:
@@ -748,29 +724,16 @@ async def queue_info():
 
 @app.get('/health', response_model=dict)
 async def health(response: Response):
-    """Health check endpoint with grace period for active jobs.
-    
-    Logic:
-    - ComfyUI responsive  -> 200 healthy
-    - ComfyUI unresponsive, no active jobs -> 502 (trigger restart)
-    - ComfyUI unresponsive, active jobs, within grace period -> 200 busy (tolerate GPU saturation)
-    - ComfyUI unresponsive, active jobs, grace period exceeded -> 502 (likely crashed/SSL issue)
-    - Counter drift safety: if last job was submitted >10min ago, treat counter as stale -> 502
-    """
-    global _comfyui_unhealthy_since
-
-    has_active_jobs = active_job_count > 0
-    # Drift safety: if counter says jobs are active but nothing submitted recently, assume drift
-    if has_active_jobs and _last_job_submitted_at > 0:
-        time_since_last_submit = time.time() - _last_job_submitted_at
-        if time_since_last_submit > _DRIFT_TIMEOUT:
-            logger.warning(f"Counter drift detected: active_job_count={active_job_count} but last submission was {time_since_last_submit:.0f}s ago, resetting")
-            has_active_jobs = False
+    """Health check endpoint - returns 200 when actively processing jobs even if ComfyUI is busy"""
+    has_active_jobs = (
+        generation_queue.qsize() > 0
+        or postprocess_queue.qsize() > 0
+        or preprocess_queue.qsize() > 0
+    )
 
     health_response = {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
-        "active_jobs": active_job_count,
         "queues": {
             "preprocess": preprocess_queue.qsize(),
             "generation": generation_queue.qsize(),
@@ -778,47 +741,31 @@ async def health(response: Response):
         }
     }
 
-    comfyui_ok = False
-    comfyui_error = None
     try:
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
-                if stats_response.status == 200:
-                    comfyui_ok = True
-                    health_response["comfyui_system_stats"] = await stats_response.json()
+                if stats_response.status != 200:
+                    if has_active_jobs:
+                        health_response["status"] = "busy"
+                        health_response["comfyui_note"] = "ComfyUI unresponsive during active generation"
+                    else:
+                        health_response["status"] = "unhealthy"
+                        health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
+                        response.status_code = 502
                 else:
-                    comfyui_error = f"System stats returned status {stats_response.status}"
+                    health_response["comfyui_system_stats"] = await stats_response.json()
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        comfyui_error = f"Failed to connect to ComfyUI: {str(e)}"
+        if has_active_jobs:
+            health_response["status"] = "busy"
+            health_response["comfyui_note"] = f"ComfyUI unresponsive during active generation: {str(e)}"
+        else:
+            health_response["status"] = "unhealthy"
+            health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
+            response.status_code = 502
     except Exception as e:
-        comfyui_error = f"Unexpected error: {str(e)}"
-
-    if comfyui_ok:
-        _comfyui_unhealthy_since = 0
-        health_response["status"] = "healthy"
-        return health_response
-
-    # ComfyUI is unresponsive
-    now = time.time()
-    if _comfyui_unhealthy_since == 0:
-        _comfyui_unhealthy_since = now
-
-    unhealthy_duration = now - _comfyui_unhealthy_since
-
-    if not has_active_jobs:
         health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = comfyui_error
+        health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
         response.status_code = 502
-        logger.warning(f"Health check FAIL: no active jobs, ComfyUI unresponsive for {unhealthy_duration:.0f}s - {comfyui_error}")
-    elif unhealthy_duration < COMFYUI_UNHEALTHY_GRACE_PERIOD:
-        health_response["status"] = "busy"
-        health_response["comfyui_note"] = f"ComfyUI unresponsive during active generation ({unhealthy_duration:.0f}s / {COMFYUI_UNHEALTHY_GRACE_PERIOD}s grace)"
-        logger.info(f"Health check OK (busy): {active_job_count} active jobs, unresponsive for {unhealthy_duration:.0f}s")
-    else:
-        health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Grace period exceeded ({unhealthy_duration:.0f}s > {COMFYUI_UNHEALTHY_GRACE_PERIOD}s): {comfyui_error}"
-        response.status_code = 502
-        logger.error(f"Health check FAIL: grace period exceeded, ComfyUI unresponsive for {unhealthy_duration:.0f}s with {active_job_count} active jobs")
 
     return health_response
