@@ -35,6 +35,9 @@ from .config import (
     # Redis Configuration
     REDIS_CONFIG,
     
+    # Health Check Configuration
+    HEALTH_CHECK_TIMEOUT,
+
     # Debug Configuration
     DEBUG_ENABLED
 )
@@ -57,5 +60,6 @@ __all__ = [
     'WEBHOOK_ENABLED',
     'WORKER_CONFIG',
     'REDIS_CONFIG',
+    'HEALTH_CHECK_TIMEOUT',
     'DEBUG_ENABLED'
 ]

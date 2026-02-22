@@ -76,6 +76,9 @@ REDIS_CONFIG = {
     "decode_responses": True
 }
 
+# Health check timeout — set based on the longest blocking operation in the workflow
+HEALTH_CHECK_TIMEOUT = int(os.getenv("HEALTH_CHECK_TIMEOUT", "30"))
+
 # Development/Debug Configuration (actually used for debug output)
 DEBUG_ENABLED = os.getenv("DEBUG", "false").lower() == "true"
 
