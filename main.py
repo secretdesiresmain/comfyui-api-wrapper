@@ -724,13 +724,7 @@ async def queue_info():
 
 @app.get('/health', response_model=dict)
 async def health(response: Response):
-    """Health check endpoint - returns 200 when actively processing jobs even if ComfyUI is busy"""
-    has_active_jobs = (
-        generation_queue.qsize() > 0
-        or postprocess_queue.qsize() > 0
-        or preprocess_queue.qsize() > 0
-    )
-
+    """Health check endpoint - returns healthy only if ComfyUI system stats is accessible"""
     health_response = {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
@@ -746,23 +740,15 @@ async def health(response: Response):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
                 if stats_response.status != 200:
-                    if has_active_jobs:
-                        health_response["status"] = "busy"
-                        health_response["comfyui_note"] = "ComfyUI unresponsive during active generation"
-                    else:
-                        health_response["status"] = "unhealthy"
-                        health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
-                        response.status_code = 502
+                    health_response["status"] = "unhealthy"
+                    health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
+                    response.status_code = 502
                 else:
                     health_response["comfyui_system_stats"] = await stats_response.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        if has_active_jobs:
-            health_response["status"] = "busy"
-            health_response["comfyui_note"] = f"ComfyUI unresponsive during active generation: {str(e)}"
-        else:
-            health_response["status"] = "unhealthy"
-            health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
-            response.status_code = 502
+    except aiohttp.ClientError as e:
+        health_response["status"] = "unhealthy"
+        health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
+        response.status_code = 502
     except Exception as e:
         health_response["status"] = "unhealthy"
         health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
