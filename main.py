@@ -74,8 +74,7 @@ active_job_count = 0
 _last_job_submitted_at: float = 0
 _completed_job_ids: set = set()
 _comfyui_unhealthy_since: float = 0
-COMFYUI_MIN_GRACE_PERIOD = 45       # baseline grace — covers benchmarks / direct ComfyUI submissions
-COMFYUI_UNHEALTHY_GRACE_PERIOD = 120  # extended grace when API wrapper has active jobs
+COMFYUI_UNHEALTHY_GRACE_PERIOD = 120  # seconds to tolerate ComfyUI unresponsiveness during active jobs
 _DRIFT_TIMEOUT = 600  # if last submission was >10min ago, assume counter drifted
 
 
@@ -749,12 +748,14 @@ async def queue_info():
 
 @app.get('/health', response_model=dict)
 async def health(response: Response):
-    """Health check endpoint with tiered grace periods.
+    """Health check endpoint with grace period for active jobs.
     
-    - ComfyUI responsive                                  -> 200 healthy
-    - ComfyUI unresponsive, within 45s baseline grace      -> 200 busy  (covers benchmarks / direct submissions)
-    - ComfyUI unresponsive, active API jobs, within 120s   -> 200 busy  (GPU saturation during generation)
-    - ComfyUI unresponsive, beyond applicable grace        -> 502       (trigger restart)
+    Logic:
+    - ComfyUI responsive  -> 200 healthy
+    - ComfyUI unresponsive, no active jobs -> 502 (trigger restart)
+    - ComfyUI unresponsive, active jobs, within grace period -> 200 busy (tolerate GPU saturation)
+    - ComfyUI unresponsive, active jobs, grace period exceeded -> 502 (likely crashed/SSL issue)
+    - Counter drift safety: if last job was submitted >10min ago, treat counter as stale -> 502
     """
     global _comfyui_unhealthy_since
 
@@ -804,27 +805,20 @@ async def health(response: Response):
         _comfyui_unhealthy_since = now
 
     unhealthy_duration = now - _comfyui_unhealthy_since
-    grace = COMFYUI_UNHEALTHY_GRACE_PERIOD if has_active_jobs else COMFYUI_MIN_GRACE_PERIOD
 
-    if unhealthy_duration < grace:
+    if not has_active_jobs:
+        health_response["status"] = "unhealthy"
+        health_response["comfyui_error"] = comfyui_error
+        response.status_code = 502
+        logger.warning(f"Health check FAIL: no active jobs, ComfyUI unresponsive for {unhealthy_duration:.0f}s - {comfyui_error}")
+    elif unhealthy_duration < COMFYUI_UNHEALTHY_GRACE_PERIOD:
         health_response["status"] = "busy"
-        health_response["comfyui_note"] = (
-            f"ComfyUI unresponsive ({unhealthy_duration:.0f}s / {grace}s grace, "
-            f"active_jobs={active_job_count})"
-        )
-        logger.info(
-            f"Health check OK (busy): active_jobs={active_job_count}, "
-            f"unresponsive for {unhealthy_duration:.0f}s / {grace}s grace"
-        )
+        health_response["comfyui_note"] = f"ComfyUI unresponsive during active generation ({unhealthy_duration:.0f}s / {COMFYUI_UNHEALTHY_GRACE_PERIOD}s grace)"
+        logger.info(f"Health check OK (busy): {active_job_count} active jobs, unresponsive for {unhealthy_duration:.0f}s")
     else:
         health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = (
-            f"Grace period exceeded ({unhealthy_duration:.0f}s > {grace}s): {comfyui_error}"
-        )
+        health_response["comfyui_error"] = f"Grace period exceeded ({unhealthy_duration:.0f}s > {COMFYUI_UNHEALTHY_GRACE_PERIOD}s): {comfyui_error}"
         response.status_code = 502
-        logger.error(
-            f"Health check FAIL: unresponsive for {unhealthy_duration:.0f}s "
-            f"(grace={grace}s), active_jobs={active_job_count}"
-        )
+        logger.error(f"Health check FAIL: grace period exceeded, ComfyUI unresponsive for {unhealthy_duration:.0f}s with {active_job_count} active jobs")
 
     return health_response
