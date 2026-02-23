@@ -284,7 +284,7 @@ def setup_logging(
                 
                 root_logger.addHandler(queue_handler)
                 root_logger.info(
-                    f"Loki logging enabled: {loki_config.url}",
+                    f"Loki logging enabled: {loki_config.url} [env={loki_config.labels.get('environment', 'unknown')}]",
                     extra={"loki_labels": loki_config.labels}
                 )
                 
