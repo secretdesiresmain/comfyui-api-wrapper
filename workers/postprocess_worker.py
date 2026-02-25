@@ -414,7 +414,8 @@ class PostprocessWorker:
                 async with session.post(
                     webhook_url,
                     json=webhook_data,
-                    headers={'Content-Type': 'application/json'}
+                    headers={'Content-Type': 'application/json'},
+                    ssl=False
                 ) as response:
                     if response.status >= 400:
                         error_text = await response.text()
