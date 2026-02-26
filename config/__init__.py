@@ -15,26 +15,38 @@ from .config import (
     # Cache Configuration
     CACHE_TYPE,
     CACHE_TTL,
-    
+
     # Directory Configuration
     COMFYUI_INSTALL_DIR,
     INPUT_DIR,
     OUTPUT_DIR,
-    
+
     # S3 Configuration
     S3_CONFIG,
     S3_ENABLED,
-    
+
     # Webhook Configuration
     WEBHOOK_CONFIG,
     WEBHOOK_ENABLED,
-    
+
     # Worker Configuration
     WORKER_CONFIG,
-    
+
     # Redis Configuration
     REDIS_CONFIG,
-    
+
+    # Health Check Configuration
+    HEALTH_CHECK_TIMEOUT,
+    HEALTH_CHECK_GRACE_PERIOD,
+
+    # ComfyUI Availability Polling
+    COMFYUI_AVAILABLE_MAX_RETRIES,
+    COMFYUI_AVAILABLE_INTERVAL_MS,
+
+    # WebSocket Reconnection
+    WEBSOCKET_RECONNECT_ATTEMPTS,
+    WEBSOCKET_RECONNECT_DELAY_S,
+
     # Debug Configuration
     DEBUG_ENABLED
 )
@@ -57,5 +69,11 @@ __all__ = [
     'WEBHOOK_ENABLED',
     'WORKER_CONFIG',
     'REDIS_CONFIG',
+    'HEALTH_CHECK_TIMEOUT',
+    'HEALTH_CHECK_GRACE_PERIOD',
+    'COMFYUI_AVAILABLE_MAX_RETRIES',
+    'COMFYUI_AVAILABLE_INTERVAL_MS',
+    'WEBSOCKET_RECONNECT_ATTEMPTS',
+    'WEBSOCKET_RECONNECT_DELAY_S',
     'DEBUG_ENABLED'
 ]

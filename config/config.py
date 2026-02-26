@@ -76,6 +76,23 @@ REDIS_CONFIG = {
     "decode_responses": True
 }
 
+# Health check timeout — set based on the longest blocking operation in the workflow
+HEALTH_CHECK_TIMEOUT = int(os.getenv("HEALTH_CHECK_TIMEOUT", "30"))
+
+# Grace period before reporting unhealthy when ComfyUI is unresponsive (seconds)
+# During heavy GPU workloads (e.g. ReActor face swaps), ComfyUI can become
+# temporarily unresponsive. This prevents Vast.ai from killing busy workers.
+HEALTH_CHECK_GRACE_PERIOD = int(os.getenv("HEALTH_CHECK_GRACE_PERIOD", "300"))
+
+# ComfyUI availability polling (RunPod-style per-job check)
+# Before each job, the generation worker polls ComfyUI to ensure it's ready.
+COMFYUI_AVAILABLE_MAX_RETRIES = int(os.getenv("COMFYUI_AVAILABLE_MAX_RETRIES", "500"))
+COMFYUI_AVAILABLE_INTERVAL_MS = int(os.getenv("COMFYUI_AVAILABLE_INTERVAL_MS", "50"))
+
+# WebSocket reconnection settings for mid-job disconnections
+WEBSOCKET_RECONNECT_ATTEMPTS = int(os.getenv("WEBSOCKET_RECONNECT_ATTEMPTS", "5"))
+WEBSOCKET_RECONNECT_DELAY_S = int(os.getenv("WEBSOCKET_RECONNECT_DELAY_S", "3"))
+
 # Development/Debug Configuration (actually used for debug output)
 DEBUG_ENABLED = os.getenv("DEBUG", "false").lower() == "true"
 

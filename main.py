@@ -18,7 +18,10 @@ import time
 import aiofiles
 
 import aiohttp
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS
+from config import (
+    CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL,
+    COMFYUI_API_SYSTEM_STATS, HEALTH_CHECK_TIMEOUT, HEALTH_CHECK_GRACE_PERIOD
+)
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
@@ -65,9 +68,23 @@ else:
     response_store = SimpleMemoryCache(namespace="response_store", ttl=CACHE_TTL)
 
 # Processing queues (defined outside cache logic)
-preprocess_queue = asyncio.Queue()    
+preprocess_queue = asyncio.Queue()
 generation_queue = asyncio.Queue()
 postprocess_queue = asyncio.Queue()
+
+# Health check state — timestamps for smart health reporting
+_last_comfyui_healthy_at: float = 0.0
+_last_generation_activity_at: float = 0.0
+
+
+def report_generation_activity():
+    """Called by generation worker to signal active processing.
+
+    This heartbeat prevents the health check from reporting unhealthy
+    while ComfyUI is busy with heavy GPU workloads (e.g. ReActor face swaps).
+    """
+    global _last_generation_activity_at
+    _last_generation_activity_at = time.time()
 
 
 @app.on_event("startup")
@@ -89,6 +106,7 @@ async def main():
         "postprocess_queue": postprocess_queue,
         "request_store": request_store,
         "response_store": response_store,
+        "on_generation_activity": report_generation_activity,
     }
 
     # Create workers using configuration
@@ -724,7 +742,18 @@ async def queue_info():
 
 @app.get('/health', response_model=dict)
 async def health(response: Response):
-    """Health check endpoint - returns healthy only if ComfyUI system stats is accessible"""
+    """Health check endpoint with grace period for busy GPU workloads.
+
+    Returns 200 when ComfyUI is responsive, or when it's temporarily
+    unresponsive but there's evidence of active processing (heartbeat,
+    queued items, or within grace period of last healthy response).
+    Returns 502 only when ComfyUI has been unresponsive with no activity
+    beyond the grace period.
+    """
+    global _last_comfyui_healthy_at
+
+    now = time.time()
+
     health_response = {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
@@ -735,23 +764,59 @@ async def health(response: Response):
         }
     }
 
+    # Try to reach ComfyUI
+    comfyui_ok = False
+    comfyui_error = None
     try:
-        timeout = aiohttp.ClientTimeout(total=5)
+        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
-                if stats_response.status != 200:
-                    health_response["status"] = "unhealthy"
-                    health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
-                    response.status_code = 502
-                else:
+                if stats_response.status == 200:
+                    comfyui_ok = True
                     health_response["comfyui_system_stats"] = await stats_response.json()
-    except aiohttp.ClientError as e:
-        health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
-        response.status_code = 502
+                else:
+                    comfyui_error = f"System stats returned status {stats_response.status}"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        comfyui_error = f"Failed to connect to ComfyUI: {str(e)}"
     except Exception as e:
+        comfyui_error = f"Unexpected error: {str(e)}"
+
+    if comfyui_ok:
+        _last_comfyui_healthy_at = now
+        return health_response
+
+    # ComfyUI is unresponsive — decide if this is "busy" or truly dead
+    time_since_healthy = now - _last_comfyui_healthy_at if _last_comfyui_healthy_at > 0 else float('inf')
+    time_since_activity = now - _last_generation_activity_at if _last_generation_activity_at > 0 else float('inf')
+
+    has_queue_items = (
+        preprocess_queue.qsize() > 0
+        or generation_queue.qsize() > 0
+        or postprocess_queue.qsize() > 0
+    )
+    has_recent_activity = time_since_activity < HEALTH_CHECK_GRACE_PERIOD
+    within_grace = time_since_healthy < HEALTH_CHECK_GRACE_PERIOD
+
+    if has_recent_activity or has_queue_items or within_grace:
+        health_response["status"] = "busy"
+        health_response["comfyui_note"] = (
+            f"ComfyUI unresponsive (last healthy: {time_since_healthy:.0f}s ago, "
+            f"last activity: {time_since_activity:.0f}s ago)"
+        )
+        logger.info(
+            f"Health check OK (busy): ComfyUI unresponsive for {time_since_healthy:.0f}s, "
+            f"last generation activity {time_since_activity:.0f}s ago, "
+            f"queues: pre={preprocess_queue.qsize()} gen={generation_queue.qsize()} post={postprocess_queue.qsize()}"
+        )
+    else:
         health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
+        health_response["comfyui_error"] = (
+            f"ComfyUI unresponsive for {time_since_healthy:.0f}s with no recent activity: {comfyui_error}"
+        )
         response.status_code = 502
+        logger.error(
+            f"Health check FAIL: ComfyUI unresponsive for {time_since_healthy:.0f}s, "
+            f"no generation activity for {time_since_activity:.0f}s - {comfyui_error}"
+        )
 
     return health_response
