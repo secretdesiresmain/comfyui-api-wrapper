@@ -1,10 +1,11 @@
 """
-Logging configuration with Grafana Loki integration.
+Logging configuration with Grafana Loki + OpenTelemetry integration.
 
 Supports:
 - Console logging (human-readable or JSON)
 - Loki log aggregation for Grafana dashboards
-- Structured logging with request context
+- OpenTelemetry OTLP export (traces + structured logs)
+- Structured logging with request context and trace correlation
 - Error tracking and metrics labels
 """
 import logging
@@ -24,12 +25,43 @@ try:
 except ImportError:
     LOKI_AVAILABLE = False
 
+# Try to import OTel trace context helpers
+try:
+    from opentelemetry import trace as otel_trace
+    OTEL_TRACE_AVAILABLE = True
+except ImportError:
+    OTEL_TRACE_AVAILABLE = False
+
+
+class TraceContextFilter(logging.Filter):
+    """
+    Injects OpenTelemetry trace context (trace_id, span_id) into every
+    log record so that console / JSON logs can be correlated with traces
+    in Grafana Tempo.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if OTEL_TRACE_AVAILABLE:
+            span = otel_trace.get_current_span()
+            ctx = span.get_span_context() if span else None
+            if ctx and ctx.trace_id:
+                record.otel_trace_id = format(ctx.trace_id, "032x")
+                record.otel_span_id = format(ctx.span_id, "016x")
+            else:
+                record.otel_trace_id = ""
+                record.otel_span_id = ""
+        else:
+            record.otel_trace_id = ""
+            record.otel_span_id = ""
+        return True
+
 
 class JSONFormatter(logging.Formatter):
     """
     JSON formatter for structured logging.
     Outputs logs in a format that's easy to parse and query in Grafana.
     Prepends [request_id] to messages when available for easy tracking.
+    Includes OTel trace_id / span_id when available.
     """
     
     def __init__(self, service_name: str = "comfyui-api"):
@@ -56,6 +88,13 @@ class JSONFormatter(logging.Formatter):
         if request_id:
             log_data["request_id"] = request_id
         
+        # Add OTel trace context for Grafana Tempo correlation
+        trace_id = getattr(record, 'otel_trace_id', '')
+        span_id = getattr(record, 'otel_span_id', '')
+        if trace_id:
+            log_data["trace_id"] = trace_id
+            log_data["span_id"] = span_id
+        
         # Add exception info if present
         if record.exc_info:
             log_data["exception"] = {
@@ -71,7 +110,8 @@ class JSONFormatter(logging.Formatter):
             'levelname', 'levelno', 'lineno', 'module', 'msecs',
             'pathname', 'process', 'processName', 'relativeCreated',
             'stack_info', 'exc_info', 'exc_text', 'thread', 'threadName',
-            'taskName', 'message', 'request_id'  # exclude request_id from extra since it's top-level
+            'taskName', 'message', 'request_id',
+            'otel_trace_id', 'otel_span_id',  # handled above
         }
         
         for key, value in record.__dict__.items():
@@ -151,9 +191,13 @@ class LokiConfig:
     
     Supports two configuration modes:
     1. Direct Loki: LOKI_URL, LOKI_USERNAME, LOKI_PASSWORD
-    2. Grafana Cloud: GRAFANA_HOSTNAME, GRAFANA_USERNAME, GRAFANA_APIKEY
+    2. Grafana Cloud (Loki endpoint): GRAFANA_HOSTNAME pointing at a
+       Loki-specific host like https://logs-prod-036.grafana.net
     
-    Grafana Cloud variables take precedence if GRAFANA_HOSTNAME is set.
+    NOTE: When GRAFANA_HOSTNAME is an OTLP gateway (contains '/otlp'),
+    logs are already sent via the OpenTelemetry OTLP exporter and Grafana
+    Cloud routes them to Loki automatically — the legacy Loki handler is
+    NOT needed and is disabled to avoid 404 errors.
     """
     
     def __init__(self):
@@ -163,14 +207,21 @@ class LokiConfig:
         grafana_apikey = os.getenv("GRAFANA_APIKEY", "")
         
         if grafana_hostname:
-            # Grafana Cloud mode
-            self.enabled = True  # Auto-enable when Grafana Cloud is configured
-            # Construct Loki push URL from Grafana hostname
-            # Grafana Cloud Loki endpoints are like: https://logs-prod-036.grafana.net
-            hostname = grafana_hostname.rstrip("/")
-            self.url = f"{hostname}/loki/api/v1/push"
-            self.username = grafana_username
-            self.password = grafana_apikey
+            # If the hostname is an OTLP gateway, skip legacy Loki —
+            # OTel OTLP exporter already handles log delivery.
+            if "/otlp" in grafana_hostname.lower():
+                self.enabled = False
+                self.url = ""
+                self.username = ""
+                self.password = ""
+            else:
+                # Grafana Cloud Loki-direct mode
+                # Expects a Loki host like: https://logs-prod-036.grafana.net
+                self.enabled = True
+                hostname = grafana_hostname.rstrip("/")
+                self.url = f"{hostname}/loki/api/v1/push"
+                self.username = grafana_username
+                self.password = grafana_apikey
         else:
             # Direct Loki mode
             self.enabled = os.getenv("LOKI_ENABLED", "false").lower() == "true"
@@ -204,16 +255,18 @@ def setup_logging(
     service_name: str = "comfyui-api",
     log_level: str = None,
     json_logs: bool = None,
-    loki_config: LokiConfig = None
+    loki_config: LokiConfig = None,
+    otel_handler: logging.Handler = None,
 ) -> logging.Logger:
     """
-    Configure application logging with optional Loki integration.
+    Configure application logging with optional Loki + OpenTelemetry integration.
     
     Args:
         service_name: Name of the service for log identification
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         json_logs: Whether to output JSON formatted logs
         loki_config: Loki configuration object
+        otel_handler: An OpenTelemetry LoggingHandler returned by ``setup_otel()``
     
     Returns:
         Configured root logger
@@ -235,8 +288,9 @@ def setup_logging(
     # Clear any existing handlers
     root_logger.handlers.clear()
     
-    # Create the request_id prefix filter (will be added to each handler)
+    # Create shared filters
     request_id_filter = RequestIdPrefixFilter()
+    trace_ctx_filter = TraceContextFilter()
     
     # Create formatters
     if json_logs:
@@ -244,14 +298,23 @@ def setup_logging(
     else:
         formatter = TextFormatter()
     
-    # Console handler with request_id filter
+    # Console handler with request_id + trace context filters
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     console_handler.setLevel(getattr(logging, log_level, logging.INFO))
+    console_handler.addFilter(trace_ctx_filter)
     console_handler.addFilter(request_id_filter)
     root_logger.addHandler(console_handler)
     
-    # Loki handler
+    # ── OpenTelemetry OTLP handler (traces + logs → Grafana) ──────
+    if otel_handler is not None:
+        otel_handler.setLevel(getattr(logging, log_level, logging.INFO))
+        otel_handler.addFilter(trace_ctx_filter)
+        otel_handler.addFilter(request_id_filter)
+        root_logger.addHandler(otel_handler)
+        root_logger.info("OpenTelemetry OTLP log handler attached to root logger")
+    
+    # ── Loki handler (legacy / direct push) ───────────────────────
     if loki_config.enabled:
         if not LOKI_AVAILABLE:
             root_logger.warning(
@@ -268,7 +331,8 @@ def setup_logging(
                 )
                 loki_handler.setLevel(getattr(logging, log_level, logging.INFO))
                 
-                # Add filter to Loki handler to prepend [request_id]
+                # Add filters to Loki handler
+                loki_handler.addFilter(trace_ctx_filter)
                 loki_handler.addFilter(request_id_filter)
                 
                 # Use queue-based handler for async logging to Loki
@@ -296,6 +360,7 @@ def setup_logging(
     logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("azure").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("opentelemetry").setLevel(logging.WARNING)
     
     return root_logger
 

@@ -104,6 +104,15 @@ GRAFANA_CLOUD_CONFIG = {
 # Check if Grafana Cloud is configured
 GRAFANA_CLOUD_ENABLED = bool(GRAFANA_CLOUD_CONFIG["hostname"])
 
+# Logging environment (used by both Loki labels and OTel resource attributes)
+LOGGING_ENVIRONMENT = os.getenv(
+    "LOGGING_ENVIRONMENT",
+    os.getenv("LOKI_ENVIRONMENT", "development"),
+)
+
+# OpenTelemetry OTLP configuration (enabled when GRAFANA_HOSTNAME is set)
+OTEL_ENABLED = GRAFANA_CLOUD_ENABLED
+
 # Print configuration summary if debug enabled
 if DEBUG_ENABLED:
     print("🔧 Configuration Summary:")

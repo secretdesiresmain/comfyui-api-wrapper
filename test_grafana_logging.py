@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 """
-Test script to verify Grafana Cloud Loki logging integration.
+Test script to verify Grafana Cloud integration via OpenTelemetry OTLP.
+
+Sends test traces AND structured logs to Grafana Cloud so you can verify
+that both Tempo (traces) and Loki (logs) are receiving data.
 
 Usage:
     python test_grafana_logging.py
 
-Make sure these environment variables are set:
-    GRAFANA_HOSTNAME=https://logs-prod-036.grafana.net
-    GRAFANA_USERNAME=1099667
-    GRAFANA_APIKEY=your_api_key
+Required environment variables:
+    GRAFANA_HOSTNAME=https://otlp-gateway-prod-us-east-2.grafana.net/otlp
+    GRAFANA_USERNAME=1141888
+    GRAFANA_APIKEY=glc_eyJvIjoiMTMyMT...
 
-Then check Grafana with query:
-    {application="comfyui-api-wrapper"}
+Then check Grafana:
+    Traces  → Explore → grafanacloud-*-traces  → Search by service.name
+    Logs    → Explore → grafanacloud-*-logs    → {service_name="vastai-server"}
 """
 
 import os
 import sys
 import time
+import uuid
 
-# Set environment variables for testing (override if needed)
-os.environ.setdefault("GRAFANA_HOSTNAME", "https://logs-prod-036.grafana.net")
-os.environ.setdefault("GRAFANA_USERNAME", "1099667")
-# GRAFANA_APIKEY must be set externally for security
-
+# ── Set environment defaults for testing ──────────────────────────────
+os.environ.setdefault(
+    "GRAFANA_HOSTNAME",
+    "https://otlp-gateway-prod-us-east-2.grafana.net/otlp",
+)
+os.environ.setdefault("GRAFANA_USERNAME", "1141888")
 os.environ.setdefault("LOG_FORMAT", "json")
 os.environ.setdefault("LOKI_APP_NAME", "comfyui-api-wrapper")
-os.environ.setdefault("LOKI_ENVIRONMENT", "testing")
+os.environ.setdefault("LOGGING_ENVIRONMENT", "beta")
 
-# Check for API key
+# ── Gate on API key ───────────────────────────────────────────────────
 if not os.environ.get("GRAFANA_APIKEY"):
     print("❌ ERROR: GRAFANA_APIKEY environment variable is not set!")
     print()
@@ -36,118 +42,133 @@ if not os.environ.get("GRAFANA_APIKEY"):
     print()
     sys.exit(1)
 
-# Now import and setup logging
+# ── Import after env vars are in place ────────────────────────────────
+from config.otel_config import setup_otel, get_tracer
 from config.logging_config import setup_logging, get_logger, ErrorMetrics
 
 print("=" * 60)
-print("🔧 Grafana Cloud Loki Logging Test")
+print("🔧 Grafana Cloud OTLP Test (Traces + Logs)")
 print("=" * 60)
 print()
 
-# Setup logging
-setup_logging(service_name="comfyui-api-wrapper")
+# 1. Initialise OTel (creates TracerProvider + LoggerProvider)
+otel_handler = setup_otel(service_name="vastai-server")
+
+# 2. Setup Python logging with the OTel handler attached
+setup_logging(service_name="vastai-server", otel_handler=otel_handler)
 logger = get_logger(__name__, test_run=True)
 
+# 3. Grab a tracer for manual span creation
+tracer = get_tracer("test_grafana_logging")
+
 print()
-print("📤 Sending test logs to Grafana Cloud...")
+print("📤 Sending test traces + logs to Grafana Cloud...")
 print()
 
-# Generate a test request_id to simulate real workflow
-import uuid
 test_request_id = f"test-{uuid.uuid4().hex[:8]}"
-print(f"🔑 Using test request_id: {test_request_id}")
+print(f"🔑 Test request_id: {test_request_id}")
 print()
 
-# Log WITHOUT request_id (no prefix)
-logger.info("Log without request_id - should have no prefix")
+# ── Test 1: Log WITHOUT any active span ──────────────────────────────
+logger.info("Log without span context – no trace_id expected")
 time.sleep(0.3)
 
-# Log WITH request_id (will have [request_id] prefix)
-logger.info("Request received - starting processing", extra={
-    "request_id": "craig-123",
-    "event": "request_start"
-})
-time.sleep(0.3)
+# ── Test 2: Log INSIDE a span (trace-correlated) ─────────────────────
+if tracer:
+    with tracer.start_as_current_span("test-request-processing") as span:
+        span.set_attribute("request.id", test_request_id)
+        span.set_attribute("test", True)
 
-logger.info("Preprocessing workflow", extra={
-    "request_id": test_request_id,
-    "stage": "preprocess_start",
-    "worker_id": 1,
-    "worker_type": "preprocess"
-})
-time.sleep(0.3)
+        logger.info(
+            "Request received – inside span, trace_id will appear in log",
+            extra={"request_id": test_request_id, "event": "request_start"},
+        )
+        time.sleep(0.3)
 
-logger.warning("Slow processing detected", extra={
-    "request_id": test_request_id,
-    "duration_ms": 5000,
-    "event": "slow_warning"
-})
-time.sleep(0.3)
+        # Nested span
+        with tracer.start_as_current_span("preprocess") as child:
+            child.set_attribute("worker.id", 1)
+            child.set_attribute("worker.type", "preprocess")
+            logger.info(
+                "Preprocessing workflow",
+                extra={
+                    "request_id": test_request_id,
+                    "stage": "preprocess_start",
+                    "worker_id": 1,
+                },
+            )
+            time.sleep(0.5)
+            child.set_attribute("preprocess.duration_ms", 500)
 
-# Simulate timing log (uses request_id)
-ErrorMetrics.log_request_timing(
-    logger,
-    request_id=test_request_id,
-    stage="preprocess",
-    duration_ms=1234.56,
-    status="success",
-    worker_id=1,
-    modifier="TestModifier"
-)
-time.sleep(0.3)
+        # Timing metric
+        ErrorMetrics.log_request_timing(
+            logger,
+            request_id=test_request_id,
+            stage="preprocess",
+            duration_ms=500.0,
+            status="success",
+            worker_id=1,
+            modifier="TestModifier",
+        )
+        time.sleep(0.3)
 
-logger.info("Generation started", extra={
-    "request_id": test_request_id,
-    "stage": "generation_start",
-    "worker_id": 1,
-    "worker_type": "generation"
-})
-time.sleep(0.3)
+        with tracer.start_as_current_span("generation") as child:
+            child.set_attribute("worker.id", 1)
+            logger.info(
+                "Generation started",
+                extra={
+                    "request_id": test_request_id,
+                    "stage": "generation_start",
+                },
+            )
+            time.sleep(0.5)
 
-# Simulate error log with different request_id
-error_request_id = f"test-{uuid.uuid4().hex[:8]}"
-try:
-    raise ValueError("Test exception for logging")
-except Exception as e:
-    ErrorMetrics.log_error(
-        logger, e, "preprocessing",
-        request_id=error_request_id,
-        worker_id=1
-    )
-time.sleep(0.3)
+        # Simulate an error inside the span
+        error_request_id = f"test-{uuid.uuid4().hex[:8]}"
+        try:
+            raise ValueError("Test exception for logging")
+        except Exception as e:
+            ErrorMetrics.log_error(
+                logger, e, "preprocessing",
+                request_id=error_request_id,
+                worker_id=1,
+            )
+        time.sleep(0.3)
 
-# Final success log
-logger.info("Request completed successfully", extra={
-    "request_id": test_request_id,
-    "event": "request_complete",
-    "total_duration_ms": 3500
-})
+        # Completion log
+        logger.info(
+            "Request completed successfully",
+            extra={
+                "request_id": test_request_id,
+                "event": "request_complete",
+                "total_duration_ms": 1800,
+            },
+        )
+else:
+    logger.info("OTel tracer not available – logging without trace context")
 
-# Wait for logs to be flushed
-print("⏳ Waiting for logs to be sent...")
-time.sleep(3)
+# ── Wait for batched export ───────────────────────────────────────────
+print()
+print("⏳ Waiting for OTLP batch export flush (5 s)…")
+time.sleep(5)
 
 print()
 print("=" * 60)
-print("✅ Test logs sent!")
+print("✅ Test data sent!")
 print("=" * 60)
 print()
-print("📊 Now check your Grafana Cloud instance:")
+print("📊 Verify in Grafana Cloud:")
 print()
-print("1. Go to: https://grafana.com → Sign in → Your Grafana instance")
-print("2. Navigate to: Explore → Select 'grafanacloud-*-logs' datasource")
-print("3. Run this query:")
+print("  TRACES (Tempo):")
+print('    Explore → grafanacloud-*-traces → Service Name = "vastai-server"')
+print(f'    Search for span name "test-request-processing"')
 print()
-print('   {application="comfyui-api-wrapper", environment="testing"}')
+print("  LOGS (Loki via OTLP):")
+print('    Explore → grafanacloud-*-logs')
+print('    {service_name="vastai-server"} | json')
+print(f'    Filter: |= "{test_request_id}"')
 print()
-print("You should see logs with [request_id] prefix in messages like:")
-print(f'   [INFO] [{test_request_id}] Request received - starting processing')
+print("  CORRELATE LOGS ↔ TRACES:")
+print("    In a trace detail view, click 'Logs for this span' to see")
+print("    logs that share the same trace_id.")
 print()
-print("🔍 Filter by specific request_id:")
-print(f'   {{application="comfyui-api-wrapper"}} |= "[{test_request_id}]"')
-print()
-print("Other useful queries:")
-print('   {application="comfyui-api-wrapper"} | json | request_id != ""')
-print('   {application="comfyui-api-wrapper"} | json | error_category != ""')
-print('   {application="comfyui-api-wrapper"} |= "metric_type"')
-

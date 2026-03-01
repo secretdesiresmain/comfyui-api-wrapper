@@ -19,14 +19,19 @@ import aiofiles
 
 from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL
 from config.logging_config import setup_logging, get_logger, ErrorMetrics
+from config.otel_config import setup_otel
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
 from workers.generation_worker import GenerationWorker
 from workers.postprocess_worker import PostprocessWorker
 
-# Configure structured logging with Loki support
-setup_logging(service_name="comfyui-api-wrapper")
+# 1. Initialise OpenTelemetry (traces + OTLP log handler) BEFORE logging
+#    so the handler is available when setup_logging is called.
+otel_handler = setup_otel(service_name="comfyui-api-wrapper")
+
+# 2. Configure structured logging with Loki + OTel support
+setup_logging(service_name="comfyui-api-wrapper", otel_handler=otel_handler)
 logger = get_logger(__name__)
 
 app = FastAPI(
@@ -35,6 +40,16 @@ app = FastAPI(
     version="1.0.0",
     redirect_slashes=False  # Disable automatic slash redirects
 )
+
+# 3. Instrument FastAPI with OpenTelemetry (auto-creates spans per request)
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    FastAPIInstrumentor.instrument_app(app)
+    logger.info("FastAPI instrumented with OpenTelemetry")
+except ImportError:
+    logger.debug("opentelemetry-instrumentation-fastapi not installed – skipping")
+except Exception as e:
+    logger.warning(f"Failed to instrument FastAPI with OpenTelemetry: {e}")
 
 # Add middleware to handle reverse proxy headers
 @app.middleware("http")
