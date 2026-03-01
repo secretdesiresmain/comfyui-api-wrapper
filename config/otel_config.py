@@ -87,7 +87,7 @@ def setup_otel(
     resource = Resource.create(
         {
             SERVICE_NAME: app_name,
-            "deployment.environment": environment,
+            "environment": environment,
             "service.namespace": "comfyui",
             "service.version": os.getenv("SERVICE_VERSION", "1.0.0"),
             "host.name": os.getenv("HOSTNAME", os.getenv("POD_NAME", "unknown")),
