@@ -13,13 +13,44 @@ import sys
 import json
 import time
 import os
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Optional, Dict, Any
 from logging.handlers import QueueHandler, QueueListener
 from queue import Queue
 
-# ── Engine / endpoint name (read once from environment) ──
+# ── Engine / endpoint name ──
+# Primary: read once from environment at startup.
+# Fallback: per-request context variable extracted from the payload.
 ENGINE_NAME: str = os.getenv("ENGINE_NAME", "")
+_endpoint_var: ContextVar[str] = ContextVar('endpoint', default='')
+
+
+def set_log_endpoint(endpoint: str) -> None:
+    """Set the endpoint context for the current async task / request."""
+    _endpoint_var.set(endpoint)
+
+
+def clear_log_endpoint() -> None:
+    """Clear the endpoint context (reset between requests)."""
+    _endpoint_var.set('')
+
+
+def extract_endpoint(payload) -> str:
+    """
+    Extract the endpoint name from a Payload / Input object.
+    Looks at ``input.webhook.session_auth_data["endpoint"]``.
+    Returns an empty string when not available.
+    """
+    try:
+        inp = getattr(payload, 'input', payload)
+        webhook = getattr(inp, 'webhook', None)
+        if webhook:
+            auth_data = getattr(webhook, 'session_auth_data', None) or {}
+            return auth_data.get('endpoint', '')
+    except Exception:
+        pass
+    return ''
 
 # Try to import Loki handler
 try:
@@ -153,38 +184,40 @@ class TextFormatter(logging.Formatter):
 
 class RequestIdPrefixFilter(logging.Filter):
     """
-    Filter that prepends [request_id] and [ENGINE_NAME] to log messages.
+    Filter that prepends [request_id] and [endpoint] to log messages.
     This modifies the record BEFORE it reaches any handler,
     so all handlers (including Loki) will see the prefix.
 
-    ENGINE_NAME is read once from the environment at import time.
+    Endpoint is resolved as:  ENGINE_NAME env var  →  per-request contextvar
     """
     
     def filter(self, record: logging.LogRecord) -> bool:
         request_id = getattr(record, 'request_id', None)
+        # Resolve endpoint: env var first, then per-request contextvar fallback
+        endpoint = ENGINE_NAME or _endpoint_var.get('')
 
         if request_id:
             # Get the fully formatted message first
             original_message = record.getMessage()
             if not original_message.startswith(f'[{request_id}]'):
-                # Build prefix: [request_id] [ENGINE_NAME] message
+                # Build prefix: [request_id] [endpoint] message
                 prefix = f'[{request_id}]'
-                if ENGINE_NAME:
-                    prefix += f' [{ENGINE_NAME}]'
+                if endpoint:
+                    prefix += f' [{endpoint}]'
                 # Replace msg with the complete formatted message + prefix
                 # Clear args since the message is now fully formatted
                 record.msg = f'{prefix} {original_message}'
                 record.args = ()
-        elif ENGINE_NAME:
-            # No request_id but we have an engine name
+        elif endpoint:
+            # No request_id but we have an endpoint
             original_message = record.getMessage()
-            if not original_message.startswith(f'[{ENGINE_NAME}]'):
-                record.msg = f'[{ENGINE_NAME}] {original_message}'
+            if not original_message.startswith(f'[{endpoint}]'):
+                record.msg = f'[{endpoint}] {original_message}'
                 record.args = ()
 
-        # Store engine name on the record so JSONFormatter can pick it up
-        if ENGINE_NAME:
-            record.endpoint = ENGINE_NAME
+        # Store endpoint on the record so JSONFormatter can pick it up
+        if endpoint:
+            record.endpoint = endpoint
         return True
 
 

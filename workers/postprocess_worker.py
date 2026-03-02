@@ -15,7 +15,7 @@ import aiohttp
 from azure.storage.blob.aio import ContainerClient
 
 from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
-from config.logging_config import get_logger, ErrorMetrics
+from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
 logger = get_logger(__name__)
 
@@ -79,6 +79,10 @@ class PostprocessWorker:
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
                 
+                # Set endpoint from request when ENGINE_NAME env var is not set
+                if not ENGINE_NAME:
+                    set_log_endpoint(extract_endpoint(request))
+
                 # Only process if we have ComfyUI output (successful generation)
                 if hasattr(result, 'comfyui_response') and result.comfyui_response:
                     logger.info(
@@ -208,6 +212,8 @@ class PostprocessWorker:
                         f"Failed to clean up request: {e}",
                         extra={"request_id": request_id}
                     )
+                if not ENGINE_NAME:
+                    clear_log_endpoint()
                 # Mark the job as complete
                 self.postprocess_queue.task_done()
             
