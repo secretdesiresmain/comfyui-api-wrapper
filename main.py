@@ -18,7 +18,7 @@ import time
 import aiofiles
 
 from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL
-from config.logging_config import setup_logging, get_logger, ErrorMetrics, extract_endpoint, set_log_endpoint
+from config.logging_config import setup_logging, get_logger, ErrorMetrics
 from config.otel_config import setup_otel
 from requestmodels.models import Payload
 from responses.result import Result
@@ -343,7 +343,6 @@ async def generate(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    set_log_endpoint(extract_endpoint(payload))
     
     result_pending = Result(id=request_id)
 
@@ -405,7 +404,6 @@ async def generate_sync(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    set_log_endpoint(extract_endpoint(payload))
 
     result_pending = Result(id=request_id)
     await request_store.set(request_id, payload)
@@ -447,7 +445,6 @@ async def generate_stream(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    set_log_endpoint(extract_endpoint(payload))
     
     result_pending = Result(id=request_id)
 
