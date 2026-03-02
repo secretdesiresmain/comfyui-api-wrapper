@@ -13,10 +13,24 @@ import sys
 import json
 import time
 import os
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Optional, Dict, Any
 from logging.handlers import QueueHandler, QueueListener
 from queue import Queue
+
+# ── Context variable for the current endpoint (set per-request in workers) ──
+_endpoint_var: ContextVar[str] = ContextVar('endpoint', default='')
+
+
+def set_log_endpoint(endpoint: str) -> None:
+    """Set the endpoint context for the current async task / request."""
+    _endpoint_var.set(endpoint)
+
+
+def clear_log_endpoint() -> None:
+    """Clear the endpoint context (reset between requests)."""
+    _endpoint_var.set('')
 
 # Try to import Loki handler
 try:
@@ -88,6 +102,11 @@ class JSONFormatter(logging.Formatter):
         if request_id:
             log_data["request_id"] = request_id
         
+        # Add endpoint as top-level field for easy Grafana querying
+        endpoint = getattr(record, 'endpoint', None)
+        if endpoint:
+            log_data["endpoint"] = endpoint
+        
         # Add OTel trace context for Grafana Tempo correlation
         trace_id = getattr(record, 'otel_trace_id', '')
         span_id = getattr(record, 'otel_span_id', '')
@@ -112,6 +131,7 @@ class JSONFormatter(logging.Formatter):
             'stack_info', 'exc_info', 'exc_text', 'thread', 'threadName',
             'taskName', 'message', 'request_id',
             'otel_trace_id', 'otel_span_id',  # handled above
+            'endpoint',  # handled above
         }
         
         for key, value in record.__dict__.items():
@@ -144,21 +164,43 @@ class TextFormatter(logging.Formatter):
 
 class RequestIdPrefixFilter(logging.Filter):
     """
-    Filter that prepends [request_id] to log messages.
+    Filter that prepends [request_id] and [endpoint] to log messages.
     This modifies the record BEFORE it reaches any handler,
     so all handlers (including Loki) will see the prefix.
+
+    The endpoint is resolved in this order:
+      1. ``extra={"endpoint": "..."}`` on the log call
+      2. The ``_endpoint_var`` context variable (set once per request
+         in the worker via ``set_log_endpoint()``)
     """
     
     def filter(self, record: logging.LogRecord) -> bool:
         request_id = getattr(record, 'request_id', None)
+        # Resolve endpoint: explicit extra > contextvar
+        endpoint = getattr(record, 'endpoint', None) or _endpoint_var.get('')
+
         if request_id:
             # Get the fully formatted message first
             original_message = record.getMessage()
             if not original_message.startswith(f'[{request_id}]'):
+                # Build prefix: [request_id] [endpoint] message
+                prefix = f'[{request_id}]'
+                if endpoint:
+                    prefix += f' [{endpoint}]'
                 # Replace msg with the complete formatted message + prefix
                 # Clear args since the message is now fully formatted
-                record.msg = f'[{request_id}] {original_message}'
+                record.msg = f'{prefix} {original_message}'
                 record.args = ()
+        elif endpoint:
+            # No request_id but we have an endpoint
+            original_message = record.getMessage()
+            if not original_message.startswith(f'[{endpoint}]'):
+                record.msg = f'[{endpoint}] {original_message}'
+                record.args = ()
+
+        # Store endpoint on the record so JSONFormatter can pick it up
+        if endpoint:
+            record.endpoint = endpoint
         return True
 
 
@@ -378,6 +420,24 @@ class LoggerAdapter(logging.LoggerAdapter):
             extra.update(kwargs['extra'])
         kwargs['extra'] = extra
         return msg, kwargs
+
+
+def extract_endpoint(payload) -> str:
+    """
+    Extract the endpoint name from a Payload / Input object.
+
+    Looks at ``input.webhook.session_auth_data["endpoint"]``.
+    Returns an empty string when not available.
+    """
+    try:
+        inp = getattr(payload, 'input', payload)  # accept Payload or Input
+        webhook = getattr(inp, 'webhook', None)
+        if webhook:
+            auth_data = getattr(webhook, 'session_auth_data', None) or {}
+            return auth_data.get('endpoint', '')
+    except Exception:
+        pass
+    return ''
 
 
 def get_logger(name: str, **context) -> logging.LoggerAdapter:

@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 
 from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET
-from config.logging_config import get_logger, ErrorMetrics
+from config.logging_config import get_logger, ErrorMetrics, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
 logger = get_logger(__name__)
 
@@ -65,6 +65,9 @@ class GenerationWorker:
                     raise Exception(f"Request {request_id} not found in store")
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
+
+                # Set endpoint context for all logs in this request
+                set_log_endpoint(extract_endpoint(request))
 
                 # Check for cancellation
                 if result and getattr(result, 'status', '') == 'cancelled':
@@ -183,6 +186,7 @@ class GenerationWorker:
                     )
             
             finally:
+                clear_log_endpoint()
                 # Mark the job as complete
                 self.generation_queue.task_done()
 
