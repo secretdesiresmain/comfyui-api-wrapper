@@ -193,6 +193,11 @@ class RequestIdPrefixFilter(logging.Filter):
     
     def filter(self, record: logging.LogRecord) -> bool:
         request_id = getattr(record, 'request_id', None)
+
+        # Suppress logs for test requests
+        if request_id and str(request_id).startswith('test-'):
+            return False
+
         # Resolve endpoint: env var first, then per-request contextvar fallback
         endpoint = ENGINE_NAME or _endpoint_var.get('')
 
