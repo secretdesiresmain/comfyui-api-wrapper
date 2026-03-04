@@ -3,6 +3,7 @@ import json
 import hashlib
 import logging
 import random
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -132,14 +133,15 @@ class BaseModifier:
         return hashlib.md5(url.encode()).hexdigest()
     
     async def download_file(self, url, target_dir):
-        """Download file from URL to target directory"""
+        """Download file from URL to target directory using a unique temp file to avoid race conditions"""
         temp_filepath = None
         try:
             file_name_hash = self.get_url_hash(url)
             target_dir = Path(target_dir)
             target_dir.mkdir(parents=True, exist_ok=True)
             
-            temp_filepath = target_dir / file_name_hash
+            # Use a unique temp filename to prevent concurrent downloads from colliding
+            temp_filepath = target_dir / f"{file_name_hash}.tmp.{uuid.uuid4().hex[:8]}"
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as response:
@@ -151,23 +153,25 @@ class BaseModifier:
                             message=f"Unable to download {url}"
                         )
                     
-                    # Write to temporary file first
                     async with aiofiles.open(temp_filepath, mode="wb") as file:
                         async for chunk in response.content.iter_chunked(8192):
                             await file.write(chunk)
                     
-                    # Determine file extension and rename
                     file_extension = await self.get_file_extension(temp_filepath)
                     final_filepath = target_dir / f"{file_name_hash}{file_extension}"
                     
-                    # Rename temp file to final name
+                    # If another worker already wrote the final file, just use it
+                    if final_filepath.exists():
+                        temp_filepath.unlink()
+                        logger.info(f"File already exists (concurrent download): {final_filepath}")
+                        return final_filepath
+                    
                     temp_filepath.rename(final_filepath)
                     
                     logger.info(f"Downloaded {url} to {final_filepath}")
                     return final_filepath
                     
         except Exception as e:
-            # Clean up temp file if it exists
             if temp_filepath is not None and temp_filepath.exists():
                 temp_filepath.unlink()
             logger.error(f"Failed to download {url}: {e}")
