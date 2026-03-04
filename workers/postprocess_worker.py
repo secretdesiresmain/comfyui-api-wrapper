@@ -15,6 +15,7 @@ import aiohttp
 from azure.storage.blob.aio import ContainerClient
 
 from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
+WEBHOOK_RETRIES: int = WEBHOOK_CONFIG.get("retries", 3)
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
 logger = get_logger(__name__)
@@ -488,71 +489,123 @@ class PostprocessWorker:
             raise
 
     async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None, request_id: str = None) -> None:
-        """Send webhook notification with result"""
-        try:
-            timeout = aiohttp.ClientTimeout(total=30)
-            
-            # Prepare webhook payload
-            webhook_data = {
-                "id": result.id,
-                "status": result.status,
-                "message": result.message,
-                "output": getattr(result, 'output', [])
-            }
-            
-            # Add extra parameters if provided
-            if extra_params:
-                webhook_data.update(extra_params)
-            
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    webhook_url,
-                    json=webhook_data,
-                    headers={'Content-Type': 'application/json'}
-                ) as response:
-                    if response.status >= 400:
-                        error_text = await response.text()
-                        logger.warning(f"Webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
-                    else:
-                        logger.info(f"Webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
+        """Send webhook notification with result. Retries on network errors and 5xx responses."""
+        timeout = aiohttp.ClientTimeout(total=30)
+        
+        # Prepare webhook payload
+        webhook_data = {
+            "id": result.id,
+            "status": result.status,
+            "message": result.message,
+            "output": getattr(result, 'output', [])
+        }
+        
+        # Add extra parameters if provided
+        if extra_params:
+            webhook_data.update(extra_params)
+        
+        last_error = None
+        for attempt in range(1, WEBHOOK_RETRIES + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        webhook_url,
+                        json=webhook_data,
+                        headers={'Content-Type': 'application/json'}
+                    ) as response:
+                        if response.status < 400:
+                            logger.info(f"Webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
+                            return
                         
-        except Exception as e:
-            logger.error(f"Error sending webhook to {webhook_url}: {e}", extra={"request_id": request_id})
-            # Don't raise - webhook failures shouldn't fail the whole job
+                        error_text = await response.text()
+                        # 4xx = client error, don't retry
+                        if response.status < 500:
+                            logger.warning(f"Webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
+                            return
+                        
+                        # 5xx = server error, retry
+                        last_error = f"status {response.status}: {error_text}"
+                        logger.warning(
+                            f"Webhook attempt {attempt}/{WEBHOOK_RETRIES} failed ({last_error})",
+                            extra={"request_id": request_id}
+                        )
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(
+                    f"Webhook attempt {attempt}/{WEBHOOK_RETRIES} error: {last_error}",
+                    extra={"request_id": request_id}
+                )
+            
+            # Exponential backoff before next retry (1s, 2s, 4s, …)
+            if attempt < WEBHOOK_RETRIES:
+                delay = 2 ** (attempt - 1)
+                await asyncio.sleep(delay)
+        
+        logger.error(
+            f"Webhook to {webhook_url} failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
+            extra={"request_id": request_id}
+        )
+        # Don't raise - webhook failures shouldn't fail the whole job
 
     
     async def send_webhook_for_session_close(self, webhook_url: str, result, session_auth_data: Dict = None, request_id: str = None) -> None:
-        """Send webhook notification with result and session auth data"""
-        try:
-            timeout = aiohttp.ClientTimeout(total=30)
-            
-            # Prepare webhook payload
-            webhook_data = {
-                "id": result.id,
-                "status": result.status,
-                "message": result.message,
-                "output": getattr(result, 'output', [])
-            }
-            
-            # Add session auth data if provided
-            if session_auth_data:
-                webhook_data["session_auth"] = session_auth_data
-            
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    webhook_url,
-                    json=webhook_data,
-                    headers={'Content-Type': 'application/json'}
-                ) as response:
-                    if response.status >= 400:
-                        error_text = await response.text()
-                        logger.warning(f"Session close webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
-                    else:
-                        logger.info(f"Session close webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
+        """Send session-close webhook notification. Retries on network errors and 5xx responses."""
+        timeout = aiohttp.ClientTimeout(total=30)
+        
+        # Prepare webhook payload
+        webhook_data = {
+            "id": result.id,
+            "status": result.status,
+            "message": result.message,
+            "output": getattr(result, 'output', [])
+        }
+        
+        # Add session auth data if provided
+        if session_auth_data:
+            webhook_data["session_auth"] = session_auth_data
+        
+        last_error = None
+        for attempt in range(1, WEBHOOK_RETRIES + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        webhook_url,
+                        json=webhook_data,
+                        headers={'Content-Type': 'application/json'}
+                    ) as response:
+                        if response.status < 400:
+                            logger.info(f"Session close webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
+                            return
                         
-        except Exception as e:
-            logger.error(f"Error sending session close webhook to {webhook_url}: {e}", extra={"request_id": request_id})
-            # Don't raise - webhook failures shouldn't fail the whole job
+                        error_text = await response.text()
+                        # 4xx = client error, don't retry
+                        if response.status < 500:
+                            logger.warning(f"Session close webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
+                            return
+                        
+                        # 5xx = server error, retry
+                        last_error = f"status {response.status}: {error_text}"
+                        logger.warning(
+                            f"Session close webhook attempt {attempt}/{WEBHOOK_RETRIES} failed ({last_error})",
+                            extra={"request_id": request_id}
+                        )
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(
+                    f"Session close webhook attempt {attempt}/{WEBHOOK_RETRIES} error: {last_error}",
+                    extra={"request_id": request_id}
+                )
+            
+            # Exponential backoff before next retry (1s, 2s, 4s, …)
+            if attempt < WEBHOOK_RETRIES:
+                delay = 2 ** (attempt - 1)
+                await asyncio.sleep(delay)
+        
+        logger.error(
+            f"Session close webhook to {webhook_url} failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
+            extra={"request_id": request_id}
+        )
+        # Don't raise - webhook failures shouldn't fail the whole job
 
     
     
