@@ -465,8 +465,7 @@ class PostprocessWorker:
         """Upload single file to Azure Blob Storage using streaming and return blob URL"""
         try:
             file_path = Path(local_path)
-            extension = file_path.suffix
-            blob_name = f"{request_id}{extension}"
+            blob_name = f"{request_id}_{file_path.name}"
             
             logger.debug(f"Uploading {blob_name} to container (streaming)", extra={"request_id": request_id})
 
