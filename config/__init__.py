@@ -43,6 +43,8 @@ from .config import (
     LOKI_CONFIG,
     GRAFANA_CLOUD_CONFIG,
     GRAFANA_CLOUD_ENABLED,
+    LOGGING_ENVIRONMENT,
+    OTEL_ENABLED,
 )
 
 # Logging utilities
@@ -53,6 +55,14 @@ from .logging_config import (
     LokiConfig,
     JSONFormatter,
     TextFormatter,
+    TraceContextFilter,
+)
+
+# OpenTelemetry utilities
+from .otel_config import (
+    setup_otel,
+    get_tracer,
+    OTEL_AVAILABLE,
 )
 
 __all__ = [
@@ -79,10 +89,17 @@ __all__ = [
     'LOKI_CONFIG',
     'GRAFANA_CLOUD_CONFIG',
     'GRAFANA_CLOUD_ENABLED',
+    'LOGGING_ENVIRONMENT',
+    'OTEL_ENABLED',
     'setup_logging',
     'get_logger',
     'ErrorMetrics',
     'LokiConfig',
     'JSONFormatter',
     'TextFormatter',
+    'TraceContextFilter',
+    # OpenTelemetry
+    'setup_otel',
+    'get_tracer',
+    'OTEL_AVAILABLE',
 ]
