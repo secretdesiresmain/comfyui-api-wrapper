@@ -10,6 +10,7 @@ from .config import (
     COMFYUI_API_HISTORY,
     COMFYUI_API_INTERRUPT,
     COMFYUI_API_WEBSOCKET,
+    COMFYUI_RETRIES,
     
     # Cache Configuration
     CACHE_TYPE,
@@ -72,6 +73,7 @@ __all__ = [
     'COMFYUI_API_HISTORY',
     'COMFYUI_API_INTERRUPT',
     'COMFYUI_API_WEBSOCKET',
+    'COMFYUI_RETRIES',
     'CACHE_TYPE',
     'COMFYUI_INSTALL_DIR',
     'INPUT_DIR',
