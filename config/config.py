@@ -23,7 +23,7 @@ COMFYUI_API_INTERRUPT = urljoin(COMFYUI_API_BASE, '/api/interrupt')
 COMFYUI_API_WEBSOCKET = COMFYUI_API_BASE.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
 
 # ComfyUI connection retry configuration
-COMFYUI_RETRIES = int(os.getenv("COMFYUI_RETRIES", "3"))
+COMFYUI_RETRIES = int(os.getenv("COMFYUI_RETRIES", "5"))
 
 # Cache configuration
 CACHE_TYPE = "redis" if os.getenv("API_CACHE", "").lower() == "redis" else "memory"

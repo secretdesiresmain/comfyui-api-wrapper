@@ -269,7 +269,8 @@ class GenerationWorker:
                     extra={"request_id": request_id}
                 )
                 if attempt < COMFYUI_RETRIES:
-                    delay = 2 ** (attempt - 1)
+                    delay = 5 * (2 ** (attempt - 1))  # 5s, 10s, 20s, 40s, …
+                    logger.info(f"Retrying in {delay}s…", extra={"request_id": request_id})
                     await asyncio.sleep(delay)
                     continue
                 raise Exception(f"Network error posting to ComfyUI after {COMFYUI_RETRIES} attempts: {last_error}")
