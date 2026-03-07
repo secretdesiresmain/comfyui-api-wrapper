@@ -274,7 +274,11 @@ class GenerationWorker:
                     continue
                 raise Exception(f"Network error posting to ComfyUI after {COMFYUI_RETRIES} attempts: {last_error}")
             except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON response from ComfyUI: {e}", extra={"request_id": request_id}, exc_info=True)
                 raise Exception(f"Invalid JSON response from ComfyUI: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error posting to ComfyUI: {e}", extra={"request_id": request_id}, exc_info=True)
+                raise
 
     async def check_if_cached(self, comfyui_job_id: str, request_id: str = None) -> bool:
         """Check if job is already complete (cached result)"""
