@@ -212,7 +212,7 @@ class GenerationWorker:
         for attempt in range(1, COMFYUI_RETRIES + 1):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    logger.debug(f"Posting workflow to {COMFYUI_API_PROMPT} (attempt {attempt}/{COMFYUI_RETRIES})", extra={"request_id": request_id})
+                    logger.info(f"Posting workflow to {COMFYUI_API_PROMPT} (attempt {attempt}/{COMFYUI_RETRIES})", extra={"request_id": request_id})
                     logger.debug(f"Workflow keys: {list(request.input.workflow_json.keys()) if isinstance(request.input.workflow_json, dict) else 'not a dict'}", extra={"request_id": request_id})
                     
                     async with session.post(
