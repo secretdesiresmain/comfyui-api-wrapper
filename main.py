@@ -18,7 +18,7 @@ import time
 import aiofiles
 import aiohttp
 
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS
+from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS, RETRY_THRESHOLD
 from config.logging_config import setup_logging, get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint
 from config.otel_config import setup_otel
 from requestmodels.models import Payload, WebHook
@@ -421,6 +421,9 @@ async def generate(
     # Health check: only proceed if ComfyUI is reachable; otherwise notify and fail
     is_healthy, health_error = await _check_health()
     if not is_healthy:
+        current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
+        under_threshold = current_retries < RETRY_THRESHOLD
+        logger.info(f"Health check: failed, and Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
         session_close_url = (
             payload.input.webhook.session_close_url
             if payload.input.webhook and payload.input.webhook.session_close_url
@@ -430,8 +433,13 @@ async def generate(
             payload.input.webhook
             and getattr(payload.input.webhook, "session_auth_data", None)
         )
-        if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
+        if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
             await _call_session_close_retry(session_close_url, payload)
+        elif not under_threshold:
+            logger.warning(
+                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), treating as failure",
+                extra={"request_id": request_id},
+            )
         logger.warning(
             f"Generate rejected: health check failed for {request_id}: {health_error}",
             extra={"request_id": request_id},
