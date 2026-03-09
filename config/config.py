@@ -84,9 +84,6 @@ REDIS_CONFIG = {
 # Development/Debug Configuration (actually used for debug output)
 DEBUG_ENABLED = os.getenv("DEBUG", "false").lower() == "true"
 
-# Mock testing: fail health check once when retries=0 so orchestrator retries; when retries>=1, pass
-MOCK_HEALTH_FAIL_ONCE = os.getenv("MOCK_HEALTH_FAIL_ONCE", "true").lower() == "true"
-
 # Logging Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = os.getenv("LOG_FORMAT", "text").lower()  # "text" or "json"

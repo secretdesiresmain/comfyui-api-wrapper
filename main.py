@@ -18,7 +18,7 @@ import time
 import aiofiles
 import aiohttp
 
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS, MOCK_HEALTH_FAIL_ONCE
+from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS
 from config.logging_config import setup_logging, get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint
 from config.otel_config import setup_otel
 from requestmodels.models import Payload, WebHook
@@ -419,12 +419,7 @@ async def generate(
         set_log_endpoint(extract_endpoint(payload))
 
     # Health check: only proceed if ComfyUI is reachable; otherwise notify and fail
-    # Mock testing: when MOCK_HEALTH_FAIL_ONCE=true, fail once when retries=0 so orchestrator retries; when retries>=1, run real check
-    if MOCK_HEALTH_FAIL_ONCE and payload.input.webhook and getattr(payload.input.webhook, "retries", 0) == 0:
-        is_healthy, health_error = False, "Mock: health check failed once for retry test"
-        logger.info(f"Mock health fail once (retries=0) for {request_id}", extra={"request_id": request_id})
-    else:
-        is_healthy, health_error = await _check_health()
+    is_healthy, health_error = await _check_health()
     if not is_healthy:
         session_close_url = (
             payload.input.webhook.session_close_url
