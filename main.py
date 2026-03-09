@@ -745,6 +745,7 @@ async def queue_info():
 
 
 @app.get('/health', response_model=dict)
+@app.get('/health/', response_model=dict)
 async def health(response: Response):
     """Health check endpoint - returns healthy only if ComfyUI system stats is accessible"""
     health_response = {
