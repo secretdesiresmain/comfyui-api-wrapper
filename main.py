@@ -2,11 +2,11 @@ import asyncio
 import uuid
 import logging
 import json
-from typing import Annotated, List
+from typing import Annotated, List, Optional
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Response, Body, Query, Request
+from fastapi import FastAPI, Response, Body, Query, Request, HTTPException
 from fastapi.responses import Response, StreamingResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
@@ -21,7 +21,7 @@ import aiohttp
 from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS
 from config.logging_config import setup_logging, get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint
 from config.otel_config import setup_otel
-from requestmodels.models import Payload
+from requestmodels.models import Payload, WebHook
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
 from workers.generation_worker import GenerationWorker
@@ -329,6 +329,77 @@ def markdown_to_html(markdown_text: str) -> str:
     return '\n'.join(html_lines)
 
 
+async def _check_health() -> tuple[bool, Optional[str]]:
+    """Check if ComfyUI system stats is accessible. Returns (is_healthy, error_message)."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
+                if stats_response.status != 200:
+                    return False, f"System stats returned status {stats_response.status}"
+                return True, None
+    except aiohttp.ClientError as e:
+        return False, f"Failed to connect to ComfyUI: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+async def _call_session_close_retry(session_close_url: str, payload: Payload) -> None:
+    """
+    POST to the orchestrator's session/close endpoint with retry=true and full input
+    so it can close the session and re-run /generate. Body matches SessionCloseRequest:
+    { session_auth, retry: true, input: { endpoint, request_id, workflow_json, webhook } }.
+    """
+    request_id = payload.input.request_id
+    webhook = payload.input.webhook
+    if not webhook or not getattr(webhook, "session_auth_data", None):
+        logger.warning(
+            "Cannot call session close retry: webhook or session_auth_data missing",
+            extra={"request_id": request_id},
+        )
+        return
+    session_auth = webhook.session_auth_data or {}
+    # Build input shape expected by orchestrator (ImageGenerationInput)
+    input_body = {
+        "endpoint": session_auth.get("endpoint"),
+        "request_id": payload.input.request_id,
+        "workflow_json": payload.input.workflow_json,
+        "webhook": webhook.model_dump() if webhook else None,
+    }
+    body = {
+        "session_auth": session_auth,
+        "retry": True,
+        "input": input_body,
+    }
+    try:
+        logger.info(
+            "Calling session close webhook (POST) for retry",
+            extra={"request_id": request_id, "session_close_url": session_close_url},
+        )
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                session_close_url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(
+                        f"Session close retry webhook returned {resp.status} for {request_id}",
+                        extra={"request_id": request_id},
+                    )
+                else:
+                    logger.info(
+                        f"Session close retry webhook accepted ({resp.status}) for {request_id}",
+                        extra={"request_id": request_id},
+                    )
+    except Exception as e:
+        logger.warning(
+            f"Session close retry webhook call failed: {e}",
+            extra={"request_id": request_id},
+        )
+
+
 # ===== ASYNC ENDPOINT (renamed from /payload) =====
 @app.post('/generate', response_model=Result)
 async def generate(
@@ -346,7 +417,30 @@ async def generate(
     request_id = payload.input.request_id
     if not ENGINE_NAME:
         set_log_endpoint(extract_endpoint(payload))
-    
+
+    # Health check: only proceed if ComfyUI is reachable; otherwise notify and fail
+    is_healthy, health_error = await _check_health()
+    if not is_healthy:
+        session_close_url = (
+            payload.input.webhook.session_close_url
+            if payload.input.webhook and payload.input.webhook.session_close_url
+            else None
+        )
+        has_session_auth = (
+            payload.input.webhook
+            and getattr(payload.input.webhook, "session_auth_data", None)
+        )
+        if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
+            await _call_session_close_retry(session_close_url, payload)
+        logger.warning(
+            f"Generate rejected: health check failed for {request_id}: {health_error}",
+            extra={"request_id": request_id},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service unavailable: {health_error}",
+        )
+
     result_pending = Result(id=request_id)
 
     try:
@@ -745,7 +839,6 @@ async def queue_info():
 
 
 @app.get('/health', response_model=dict)
-@app.get('/health/', response_model=dict)
 async def health(response: Response):
     """Health check endpoint - returns healthy only if ComfyUI system stats is accessible"""
     health_response = {
