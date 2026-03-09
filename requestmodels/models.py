@@ -54,6 +54,7 @@ class WebHook(BaseModel):
     extra_params: Dict = Field(default_factory=dict)
     timeout: int = Field(default=30)
     session_auth_data: Optional[Dict] = Field(default=None)
+    retries: int = Field(default=0, description="Number of retries (passed through for orchestrator)")
     
     @staticmethod
     def get_defaults():
@@ -61,7 +62,8 @@ class WebHook(BaseModel):
             "url": "",
             "session_close_url": "",
             "extra_params": {},
-            "timeout": 30
+            "timeout": 30,
+            "retries": 0,
         }
     
     def has_valid_url(self) -> bool:

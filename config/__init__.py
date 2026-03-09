@@ -38,6 +38,7 @@ from .config import (
     
     # Debug Configuration
     DEBUG_ENABLED,
+    MOCK_HEALTH_FAIL_ONCE,
     
     # Logging Configuration
     LOG_LEVEL,
@@ -87,6 +88,7 @@ __all__ = [
     'WORKER_CONFIG',
     'REDIS_CONFIG',
     'DEBUG_ENABLED',
+    'MOCK_HEALTH_FAIL_ONCE',
     # Logging
     'LOG_LEVEL',
     'LOG_FORMAT',
