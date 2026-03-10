@@ -18,6 +18,7 @@ COMFYUI_API_PROMPT = urljoin(COMFYUI_API_BASE, '/prompt')
 COMFYUI_API_QUEUE = urljoin(COMFYUI_API_BASE, '/queue')
 COMFYUI_API_HISTORY = urljoin(COMFYUI_API_BASE, '/history')
 COMFYUI_API_INTERRUPT = urljoin(COMFYUI_API_BASE, '/api/interrupt')
+COMFYUI_API_SYSTEM_STATS = urljoin(COMFYUI_API_BASE, '/system_stats')
 
 # WebSocket endpoint (convert http to ws, https to wss)
 COMFYUI_API_WEBSOCKET = COMFYUI_API_BASE.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
@@ -82,6 +83,9 @@ REDIS_CONFIG = {
 
 # Development/Debug Configuration (actually used for debug output)
 DEBUG_ENABLED = os.getenv("DEBUG", "false").lower() == "true"
+
+# Retry threshold: when health check fails, only trigger session-close-with-retry if webhook.retries < this value
+RETRY_THRESHOLD = int(os.getenv("RETRY_THRESHOLD", "3"))
 
 # Logging Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
