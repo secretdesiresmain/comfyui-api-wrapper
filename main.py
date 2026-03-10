@@ -329,15 +329,17 @@ def markdown_to_html(markdown_text: str) -> str:
     return '\n'.join(html_lines)
 
 
-async def _check_health() -> tuple[bool, Optional[str]]:
+async def _check_health(request_id: Optional[str] = None) -> tuple[bool, Optional[str]]:
     """Check if ComfyUI system stats is accessible. Returns (is_healthy, error_message)."""
+    extra = {"request_id": request_id} if request_id is not None else {}
     try:
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
                 if stats_response.status != 200:
                     return False, f"System stats returned status {stats_response.status}"
-                logger.info(f"Health check: passed and system stats returned {stats_response.json()}", extra={"request_id": request_id})
+                await stats_response.read()  # consume body so connection can be closed
+                logger.info("Health check: passed (ComfyUI system stats reachable)", extra=extra)
                 return True, None
     except aiohttp.ClientError as e:
         return False, f"Failed to connect to ComfyUI: {str(e)}"
@@ -420,7 +422,7 @@ async def generate(
         set_log_endpoint(extract_endpoint(payload))
 
     # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
-    is_healthy, health_error = await _check_health()
+    is_healthy, health_error = await _check_health(request_id)
     if not is_healthy:
         current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
         under_threshold = current_retries < RETRY_THRESHOLD
