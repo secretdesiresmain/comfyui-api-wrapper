@@ -535,9 +535,9 @@ class PostprocessWorker:
                     extra={"request_id": request_id}
                 )
             
-            # Exponential backoff before next retry (1s, 2s, 4s, …)
+            # Exponential backoff before next retry (5s, 10s, 20s, …)
             if attempt < WEBHOOK_RETRIES:
-                delay = 2 ** (attempt - 1)
+                delay = 5 * 2 ** (attempt - 1)
                 await asyncio.sleep(delay)
         
         logger.error(
@@ -595,9 +595,9 @@ class PostprocessWorker:
                     extra={"request_id": request_id}
                 )
             
-            # Exponential backoff before next retry (1s, 2s, 4s, …)
+            # Exponential backoff before next retry (5s, 10s, 20s, …)
             if attempt < WEBHOOK_RETRIES:
-                delay = 2 ** (attempt - 1)
+                delay = 5 * 2 ** (attempt - 1)
                 await asyncio.sleep(delay)
         
         logger.error(
