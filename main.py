@@ -337,6 +337,7 @@ async def _check_health() -> tuple[bool, Optional[str]]:
             async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
                 if stats_response.status != 200:
                     return False, f"System stats returned status {stats_response.status}"
+                logger.info(f"Health check: passed and system stats returned {stats_response.json()}", extra={"request_id": request_id})
                 return True, None
     except aiohttp.ClientError as e:
         return False, f"Failed to connect to ComfyUI: {str(e)}"
@@ -418,7 +419,7 @@ async def generate(
     if not ENGINE_NAME:
         set_log_endpoint(extract_endpoint(payload))
 
-    # Health check: only proceed if ComfyUI is reachable; otherwise notify and fail
+    # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
     is_healthy, health_error = await _check_health()
     if not is_healthy:
         current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
@@ -448,7 +449,6 @@ async def generate(
             status_code=503,
             detail=f"Service unavailable: {health_error}",
         )
-
     result_pending = Result(id=request_id)
 
     try:
@@ -847,8 +847,12 @@ async def queue_info():
 
 
 @app.get('/health', response_model=dict)
-async def health(response: Response):
-    """Health check endpoint - returns healthy only if ComfyUI system stats is accessible"""
+@app.get('/health/', response_model=dict)
+async def health(
+    response: Response,
+    comfy: bool = Query(False, description="If true, include ComfyUI system stats check; otherwise only container liveness"),
+):
+    """Health check: liveness only by default; pass ?comfy=true to include ComfyUI system stats check."""
     health_response = {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
@@ -859,23 +863,24 @@ async def health(response: Response):
         }
     }
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
-                if stats_response.status != 200:
-                    health_response["status"] = "unhealthy"
-                    health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
-                    response.status_code = 502
-                else:
-                    health_response["comfyui_system_stats"] = await stats_response.json()
-    except aiohttp.ClientError as e:
-        health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
-        response.status_code = 502
-    except Exception as e:
-        health_response["status"] = "unhealthy"
-        health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
-        response.status_code = 502
+    if comfy:
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
+                    if stats_response.status != 200:
+                        health_response["status"] = "unhealthy"
+                        health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
+                        response.status_code = 502
+                    else:
+                        health_response["comfyui_system_stats"] = await stats_response.json()
+        except aiohttp.ClientError as e:
+            health_response["status"] = "unhealthy"
+            health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
+            response.status_code = 502
+        except Exception as e:
+            health_response["status"] = "unhealthy"
+            health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
+            response.status_code = 502
 
     return health_response
