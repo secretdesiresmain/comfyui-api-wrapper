@@ -41,6 +41,12 @@ class PostprocessWorker:
         
         # Configuration
         self.output_dir = Path(OUTPUT_DIR)
+        
+        # Shared connector with DNS caching (TTL 300s = 5 min)
+        self._connector = aiohttp.TCPConnector(
+            use_dns_cache=True,
+            ttl_dns_cache=300,
+        )
 
     async def work(self):
         logger.info(
@@ -506,7 +512,7 @@ class PostprocessWorker:
         last_error = None
         for attempt in range(1, WEBHOOK_RETRIES + 1):
             try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with aiohttp.ClientSession(timeout=timeout, connector=self._connector, connector_owner=False) as session:
                     async with session.post(
                         webhook_url,
                         json=webhook_data,
@@ -535,9 +541,9 @@ class PostprocessWorker:
                     extra={"request_id": request_id}
                 )
             
-            # Exponential backoff before next retry (5s, 10s, 20s, …)
+            # Exponential backoff before next retry (10s, 20s, 40s, …)
             if attempt < WEBHOOK_RETRIES:
-                delay = 5 * 2 ** (attempt - 1)
+                delay = 10 * 2 ** (attempt - 1)
                 await asyncio.sleep(delay)
         
         logger.error(
@@ -566,7 +572,7 @@ class PostprocessWorker:
         last_error = None
         for attempt in range(1, WEBHOOK_RETRIES + 1):
             try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with aiohttp.ClientSession(timeout=timeout, connector=self._connector, connector_owner=False) as session:
                     async with session.post(
                         webhook_url,
                         json=webhook_data,
@@ -595,9 +601,9 @@ class PostprocessWorker:
                     extra={"request_id": request_id}
                 )
             
-            # Exponential backoff before next retry (5s, 10s, 20s, …)
+            # Exponential backoff before next retry (10s, 20s, 40s, …)
             if attempt < WEBHOOK_RETRIES:
-                delay = 5 * 2 ** (attempt - 1)
+                delay = 10 * 2 ** (attempt - 1)
                 await asyncio.sleep(delay)
         
         logger.error(

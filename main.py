@@ -342,9 +342,9 @@ async def _check_health(request_id: Optional[str] = None) -> tuple[bool, Optiona
                 logger.info("Health check: passed (ComfyUI system stats reachable)", extra=extra)
                 return True, None
     except aiohttp.ClientError as e:
-        return False, f"Failed to connect to ComfyUI: {str(e)}"
+        return False, f"Failed to connect to ComfyUI: {type(e).__name__}: {e}"
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return False, f"Unexpected error: {type(e).__name__}: {e}"
 
 
 async def _call_session_close_retry(session_close_url: str, payload: Payload) -> None:
@@ -438,18 +438,21 @@ async def generate(
         )
         if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
             await _call_session_close_retry(session_close_url, payload)
-        elif not under_threshold:
             logger.warning(
-                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), treating as failure",
+                f"Generate rejected: health check failed for {request_id}: {health_error}, session close retry requested",
                 extra={"request_id": request_id},
             )
-        logger.warning(
-            f"Generate rejected: health check failed for {request_id}: {health_error}",
-            extra={"request_id": request_id},
-        )
-        raise HTTPException(
-            status_code=503,
-            detail=f"Service unavailable: {health_error}",
+        else:
+            logger.error(
+                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}: {health_error}",
+                extra={"request_id": request_id},
+            )
+        
+        response.status_code = 200
+        return Result(
+            id=request_id,
+            status="failed",
+            message=f"Service unavailable: {health_error} for request ID : {request_id}",
         )
     result_pending = Result(id=request_id)
 

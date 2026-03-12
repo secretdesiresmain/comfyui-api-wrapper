@@ -58,7 +58,7 @@ WEBHOOK_CONFIG = {
     "url": os.getenv("WEBHOOK_URL", ""),
     "session-close-url": os.getenv("WEBHOOK_SESSION_CLOSE_URL", ""),
     "timeout": int(os.getenv("WEBHOOK_TIMEOUT", "30")),
-    "retries": int(os.getenv("WEBHOOK_RETRIES", "3")),
+    "retries": int(os.getenv("WEBHOOK_RETRIES", "5")),
 }
 
 # Check if webhook is configured via environment
