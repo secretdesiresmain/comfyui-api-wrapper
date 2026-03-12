@@ -39,6 +39,7 @@ from .config import (
     # Debug Configuration
     DEBUG_ENABLED,
     RETRY_THRESHOLD,
+    FORCE_HEALTH_CHECK_FAIL,
     
     # Logging Configuration
     LOG_LEVEL,
@@ -89,6 +90,7 @@ __all__ = [
     'REDIS_CONFIG',
     'DEBUG_ENABLED',
     'RETRY_THRESHOLD',
+    'FORCE_HEALTH_CHECK_FAIL',
     # Logging
     'LOG_LEVEL',
     'LOG_FORMAT',

@@ -58,7 +58,7 @@ WEBHOOK_CONFIG = {
     "url": os.getenv("WEBHOOK_URL", ""),
     "session-close-url": os.getenv("WEBHOOK_SESSION_CLOSE_URL", ""),
     "timeout": int(os.getenv("WEBHOOK_TIMEOUT", "30")),
-    "retries": int(os.getenv("WEBHOOK_RETRIES", "3")),
+    "retries": int(os.getenv("WEBHOOK_RETRIES", "5")),
 }
 
 # Check if webhook is configured via environment
@@ -86,6 +86,9 @@ DEBUG_ENABLED = os.getenv("DEBUG", "false").lower() == "true"
 
 # Retry threshold: when health check fails, only trigger session-close-with-retry if webhook.retries < this value
 RETRY_THRESHOLD = int(os.getenv("RETRY_THRESHOLD", "3"))
+
+# When true, health check is forced to fail so generate requests always trigger session-close retry
+FORCE_HEALTH_CHECK_FAIL = os.getenv("FORCE_HEALTH_CHECK_FAIL", "false").lower() == "true"
 
 # Logging Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
