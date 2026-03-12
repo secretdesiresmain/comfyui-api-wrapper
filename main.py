@@ -18,7 +18,7 @@ import time
 import aiofiles
 import aiohttp
 
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS, RETRY_THRESHOLD
+from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS, RETRY_THRESHOLD, FORCE_HEALTH_CHECK_FAIL
 from config.logging_config import setup_logging, get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint
 from config.otel_config import setup_otel
 from requestmodels.models import Payload, WebHook
@@ -422,7 +422,11 @@ async def generate(
         set_log_endpoint(extract_endpoint(payload))
 
     # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
-    is_healthy, health_error = await _check_health(request_id)
+    if FORCE_HEALTH_CHECK_FAIL:
+        is_healthy, health_error = False, "Forced health check failure (FORCE_HEALTH_CHECK_FAIL=true)"
+        logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL", extra={"request_id": request_id})
+    else:
+        is_healthy, health_error = await _check_health(request_id)
     if not is_healthy:
         current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
         under_threshold = current_retries < RETRY_THRESHOLD
