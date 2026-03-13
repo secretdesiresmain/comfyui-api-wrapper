@@ -542,6 +542,7 @@ async def generate_sync(
     await request_store.set(request_id, payload)
     await response_store.set(request_id, result_pending)
     await preprocess_queue.put(request_id)
+    in_flight_requests["total"] += 1
 
     logger.info(f"Queued synchronous request {request_id}", extra={"request_id": request_id})
 
@@ -588,6 +589,7 @@ async def generate_stream(
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
         await preprocess_queue.put(request_id)
+        in_flight_requests["total"] += 1
         
         logger.info(f"Starting stream for request {request_id}", extra={"request_id": request_id})
         
