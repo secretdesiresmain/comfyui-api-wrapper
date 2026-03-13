@@ -425,6 +425,7 @@ async def generate(
     ],
 ):
     """Submit a new generation request (async)"""
+    global FOUND_UNHEALTHY
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
@@ -440,7 +441,6 @@ async def generate(
     else:
         is_healthy, health_error = await _check_health(request_id)
     if not is_healthy:
-        global FOUND_UNHEALTHY
         FOUND_UNHEALTHY = True
         current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
         under_threshold = current_retries < RETRY_THRESHOLD
