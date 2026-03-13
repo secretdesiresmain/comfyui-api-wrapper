@@ -85,6 +85,10 @@ preprocess_queue = asyncio.Queue()
 generation_queue = asyncio.Queue()
 postprocess_queue = asyncio.Queue()
 
+FOUND_UNHEALTHY: bool = False
+
+in_flight_requests: dict = {"total": 0, "preprocess": 0, "generation": 0, "postprocess": 0}
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -105,6 +109,7 @@ async def main():
         "postprocess_queue": postprocess_queue,
         "request_store": request_store,
         "response_store": response_store,
+        "in_flight_requests": in_flight_requests,
     }
 
     # Create workers using configuration
@@ -430,12 +435,16 @@ async def generate(
     if FORCE_HEALTH_CHECK_FAIL:
         is_healthy, health_error = False, "Forced health check failure (FORCE_HEALTH_CHECK_FAIL=true)"
         logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL", extra={"request_id": request_id})
+    elif FOUND_UNHEALTHY:
+        is_healthy, health_error = False, "Instance previously failed a ComfyUI health check during /generate and no requests are in flight. FOUND_UNHEALTHY is True."
     else:
         is_healthy, health_error = await _check_health(request_id)
     if not is_healthy:
+        global FOUND_UNHEALTHY
+        FOUND_UNHEALTHY = True
         current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
         under_threshold = current_retries < RETRY_THRESHOLD
-        logger.info(f"Health check: failed, and Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
+        logger.info(f"Health check: failed, FOUND_UNHEALTHY set to True. Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
         session_close_url = (
             payload.input.webhook.session_close_url
             if payload.input.webhook and payload.input.webhook.session_close_url
@@ -448,14 +457,14 @@ async def generate(
         if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
             _call_session_close(session_close_url, payload, retry=True)
             logger.warning(
-                f"Generate rejected: health check failed for {request_id}: {health_error}, session close with retry requested",
+                f"Generate rejected: health check failed for {request_id}: {health_error}, session close with retry requested.",
                 extra={"request_id": request_id},
             )
         else:
             if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
                 _call_session_close(session_close_url, payload, retry=False)
             logger.error(
-                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}: {health_error}",
+                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}: {health_error}.",
                 extra={"request_id": request_id},
             )
         
@@ -472,6 +481,7 @@ async def generate(
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
         await preprocess_queue.put(request_id)
+        in_flight_requests["total"] += 1
         
         logger.info(f"Queued request {request_id}", extra={"request_id": request_id})
         response.status_code = 202
@@ -866,37 +876,30 @@ async def queue_info():
 @app.get('/health/', response_model=dict)
 async def health(
     response: Response,
-    comfy: bool = Query(False, description="If true, include ComfyUI system stats check; otherwise only container liveness"),
 ):
     """Health check: liveness only by default; pass ?comfy=true to include ComfyUI system stats check."""
-    health_response = {
+    if FOUND_UNHEALTHY and in_flight_requests["total"] == 0:
+        response.status_code = 502
+        return {
+            "status": "unhealthy",
+            "reason": "Instance previously failed a ComfyUI health check during /generate and no requests are in flight. FOUND_UNHEALTHY is True.",
+            "cache_type": CACHE_TYPE,
+            "in_flight_requests": in_flight_requests,
+            "queues": {
+                "preprocess": preprocess_queue.qsize(),
+                "generation": generation_queue.qsize(),
+                "postprocess": postprocess_queue.qsize(),
+            },
+        }
+    logger.info(f"Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()}", extra={"request_id": None})
+
+    return {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
+        "in_flight_requests": in_flight_requests,
         "queues": {
             "preprocess": preprocess_queue.qsize(),
             "generation": generation_queue.qsize(),
             "postprocess": postprocess_queue.qsize(),
-        }
+        },
     }
-
-    if comfy:
-        try:
-            timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
-                    if stats_response.status != 200:
-                        health_response["status"] = "unhealthy"
-                        health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
-                        response.status_code = 502
-                    else:
-                        health_response["comfyui_system_stats"] = await stats_response.json()
-        except aiohttp.ClientError as e:
-            health_response["status"] = "unhealthy"
-            health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
-            response.status_code = 502
-        except Exception as e:
-            health_response["status"] = "unhealthy"
-            health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
-            response.status_code = 502
-
-    return health_response

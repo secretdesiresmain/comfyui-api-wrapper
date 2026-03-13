@@ -141,6 +141,11 @@ class JSONFormatter(logging.Formatter):
         if endpoint:
             log_data["endpoint"] = endpoint
         
+        # Add instance URL as top-level field for easy Grafana querying
+        instance_url = getattr(record, 'instance_url', None)
+        if instance_url:
+            log_data["instance_url"] = instance_url
+        
         # Add OTel trace context for Grafana Tempo correlation
         trace_id = getattr(record, 'otel_trace_id', '')
         span_id = getattr(record, 'otel_span_id', '')
@@ -165,7 +170,7 @@ class JSONFormatter(logging.Formatter):
             'stack_info', 'exc_info', 'exc_text', 'thread', 'threadName',
             'taskName', 'message', 'request_id',
             'otel_trace_id', 'otel_span_id',  # handled above
-            'endpoint',  # handled above
+            'endpoint', 'instance_url',  # handled above
         }
         
         for key, value in record.__dict__.items():
