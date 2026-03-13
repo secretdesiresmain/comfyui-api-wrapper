@@ -882,6 +882,7 @@ async def health(
     """Health check: liveness only by default; pass ?comfy=true to include ComfyUI system stats check."""
     if FOUND_UNHEALTHY and in_flight_requests["total"] == 0:
         response.status_code = 502
+        logger.error(f"Restart initiated: Health check: unhealthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
         return {
             "status": "unhealthy",
             "reason": "Instance previously failed a ComfyUI health check during /generate and no requests are in flight. FOUND_UNHEALTHY is True.",
@@ -893,7 +894,7 @@ async def health(
                 "postprocess": postprocess_queue.qsize(),
             },
         }
-    logger.info(f"Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()}", extra={"request_id": None})
+    logger.info(f"Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
 
     return {
         "status": "healthy",
