@@ -347,38 +347,9 @@ async def _check_health(request_id: Optional[str] = None) -> tuple[bool, Optiona
         return False, f"Unexpected error: {type(e).__name__}: {e}"
 
 
-async def _call_session_close_retry(session_close_url: str, payload: Payload) -> None:
-    """
-    POST to the orchestrator's session/close endpoint with retry=true and full input
-    so it can close the session and re-run /generate. Body matches SessionCloseRequest:
-    { session_auth, retry: true, input: { endpoint, request_id, workflow_json, webhook } }.
-    """
-    request_id = payload.input.request_id
-    webhook = payload.input.webhook
-    if not webhook or not getattr(webhook, "session_auth_data", None):
-        logger.warning(
-            "Cannot call session close retry: webhook or session_auth_data missing",
-            extra={"request_id": request_id},
-        )
-        return
-    session_auth = webhook.session_auth_data or {}
-    # Build input shape expected by orchestrator (ImageGenerationInput)
-    input_body = {
-        "endpoint": session_auth.get("endpoint"),
-        "request_id": payload.input.request_id,
-        "workflow_json": payload.input.workflow_json,
-        "webhook": webhook.model_dump() if webhook else None,
-    }
-    body = {
-        "session_auth": session_auth,
-        "retry": True,
-        "input": input_body,
-    }
+async def _fire_session_close_retry(session_close_url: str, body: dict, request_id: str) -> None:
+    """Background task: POST to session/close and log the outcome."""
     try:
-        logger.info(
-            "Calling session close webhook (POST) for retry",
-            extra={"request_id": request_id, "session_close_url": session_close_url},
-        )
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
@@ -401,6 +372,40 @@ async def _call_session_close_retry(session_close_url: str, payload: Payload) ->
             f"Session close retry webhook call failed: {e}",
             extra={"request_id": request_id},
         )
+
+
+def _call_session_close(session_close_url: str, payload: Payload, retry: bool = True) -> None:
+    """
+    Fire-and-forget POST to the orchestrator's session/close endpoint.
+    When retry=True the orchestrator will close the session and re-run /generate.
+    When retry=False the orchestrator will just close the session.
+    """
+    request_id = payload.input.request_id
+    webhook = payload.input.webhook
+    if not webhook or not getattr(webhook, "session_auth_data", None):
+        logger.warning(
+            "Cannot call session close: webhook or session_auth_data missing",
+            extra={"request_id": request_id},
+        )
+        return
+    session_auth = webhook.session_auth_data or {}
+    input_body = {
+        "endpoint": session_auth.get("endpoint"),
+        "request_id": payload.input.request_id,
+        "workflow_json": payload.input.workflow_json,
+        "webhook": webhook.model_dump() if webhook else None,
+    }
+    body = {
+        "session_auth": session_auth,
+    }
+    if retry:
+        body["retry"] = True
+        body["input"] = input_body
+    logger.info(
+        f"Firing session close webhook (POST, retry={retry}) (fire-and-forget)",
+        extra={"request_id": request_id, "session_close_url": session_close_url},
+    )
+    asyncio.create_task(_fire_session_close_retry(session_close_url, body, request_id))
 
 
 # ===== ASYNC ENDPOINT (renamed from /payload) =====
@@ -441,12 +446,14 @@ async def generate(
             and getattr(payload.input.webhook, "session_auth_data", None)
         )
         if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
-            await _call_session_close_retry(session_close_url, payload)
+            _call_session_close(session_close_url, payload, retry=True)
             logger.warning(
-                f"Generate rejected: health check failed for {request_id}: {health_error}, session close retry requested",
+                f"Generate rejected: health check failed for {request_id}: {health_error}, session close with retry requested",
                 extra={"request_id": request_id},
             )
         else:
+            if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
+                _call_session_close(session_close_url, payload, retry=False)
             logger.error(
                 f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}: {health_error}",
                 extra={"request_id": request_id},
