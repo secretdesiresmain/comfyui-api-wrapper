@@ -60,6 +60,7 @@ from .logging_config import (
     JSONFormatter,
     TextFormatter,
     TraceContextFilter,
+    INSTANCE_URL,
 )
 
 # OpenTelemetry utilities
@@ -106,6 +107,7 @@ __all__ = [
     'JSONFormatter',
     'TextFormatter',
     'TraceContextFilter',
+    'INSTANCE_URL',
     # OpenTelemetry
     'setup_otel',
     'get_tracer',

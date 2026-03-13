@@ -23,6 +23,20 @@ from queue import Queue
 # Primary: read once from environment at startup.
 # Fallback: per-request context variable extracted from the payload.
 ENGINE_NAME: str = os.getenv("ENGINE_NAME", "")
+
+# ── Instance URL (Vast.ai) ──
+# Built from predefined Vast.ai env vars: PUBLIC_IPADDR + VAST_TCP_PORT_<port>
+def _resolve_instance_url() -> str:
+    public_ip = os.getenv("PUBLIC_IPADDR", "")
+    if not public_ip:
+        return ""
+    api_port = os.getenv("API_PORT", "8000")
+    external_port = os.getenv(f"VAST_TCP_PORT_{api_port}", "")
+    if external_port:
+        return f"{public_ip}:{external_port}"
+    return public_ip
+
+INSTANCE_URL: str = _resolve_instance_url()
 _endpoint_var: ContextVar[str] = ContextVar('endpoint', default='')
 
 
@@ -205,24 +219,30 @@ class RequestIdPrefixFilter(logging.Filter):
             # Get the fully formatted message first
             original_message = record.getMessage()
             if not original_message.startswith(f'[{request_id}]'):
-                # Build prefix: [request_id] [endpoint] message
+                # Build prefix: [request_id] [endpoint] [instance_url] message
                 prefix = f'[{request_id}]'
                 if endpoint:
                     prefix += f' [{endpoint}]'
-                # Replace msg with the complete formatted message + prefix
-                # Clear args since the message is now fully formatted
+                if INSTANCE_URL:
+                    prefix += f' [{INSTANCE_URL}]'
                 record.msg = f'{prefix} {original_message}'
                 record.args = ()
-        elif endpoint:
-            # No request_id but we have an endpoint
+        elif endpoint or INSTANCE_URL:
             original_message = record.getMessage()
-            if not original_message.startswith(f'[{endpoint}]'):
-                record.msg = f'[{endpoint}] {original_message}'
+            prefix_parts = []
+            if endpoint:
+                prefix_parts.append(f'[{endpoint}]')
+            if INSTANCE_URL:
+                prefix_parts.append(f'[{INSTANCE_URL}]')
+            prefix = ' '.join(prefix_parts)
+            if not original_message.startswith(prefix):
+                record.msg = f'{prefix} {original_message}'
                 record.args = ()
 
-        # Store endpoint on the record so JSONFormatter can pick it up
         if endpoint:
             record.endpoint = endpoint
+        if INSTANCE_URL:
+            record.instance_url = INSTANCE_URL
         return True
 
 
