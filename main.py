@@ -894,7 +894,7 @@ async def health(
                 "postprocess": postprocess_queue.qsize(),
             },
         }
-    logger.info(f"Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
+    logger.debug(f"Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
 
     return {
         "status": "healthy",

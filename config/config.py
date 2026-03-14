@@ -24,7 +24,7 @@ COMFYUI_API_SYSTEM_STATS = urljoin(COMFYUI_API_BASE, '/system_stats')
 COMFYUI_API_WEBSOCKET = COMFYUI_API_BASE.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
 
 # ComfyUI connection retry configuration
-COMFYUI_RETRIES = int(os.getenv("COMFYUI_RETRIES", "5"))
+COMFYUI_RETRIES = int(os.getenv("COMFYUI_RETRIES", "3"))
 
 # Cache configuration
 CACHE_TYPE = "redis" if os.getenv("API_CACHE", "").lower() == "redis" else "memory"
@@ -58,7 +58,7 @@ WEBHOOK_CONFIG = {
     "url": os.getenv("WEBHOOK_URL", ""),
     "session-close-url": os.getenv("WEBHOOK_SESSION_CLOSE_URL", ""),
     "timeout": int(os.getenv("WEBHOOK_TIMEOUT", "30")),
-    "retries": int(os.getenv("WEBHOOK_RETRIES", "5")),
+    "retries": int(os.getenv("WEBHOOK_RETRIES", "3")),
 }
 
 # Check if webhook is configured via environment
