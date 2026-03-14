@@ -40,6 +40,7 @@ from .config import (
     DEBUG_ENABLED,
     RETRY_THRESHOLD,
     FORCE_HEALTH_CHECK_FAIL,
+    SHOULD_RESTART_ON_FAILURE,
     
     # Logging Configuration
     LOG_LEVEL,
@@ -92,6 +93,7 @@ __all__ = [
     'DEBUG_ENABLED',
     'RETRY_THRESHOLD',
     'FORCE_HEALTH_CHECK_FAIL',
+    'SHOULD_RESTART_ON_FAILURE',
     # Logging
     'LOG_LEVEL',
     'LOG_FORMAT',

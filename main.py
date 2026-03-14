@@ -18,7 +18,7 @@ import time
 import aiofiles
 import aiohttp
 
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS, RETRY_THRESHOLD, FORCE_HEALTH_CHECK_FAIL
+from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS, RETRY_THRESHOLD, FORCE_HEALTH_CHECK_FAIL, SHOULD_RESTART_ON_FAILURE
 from config.logging_config import setup_logging, get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint
 from config.otel_config import setup_otel
 from requestmodels.models import Payload, WebHook
@@ -880,7 +880,7 @@ async def health(
     response: Response,
 ):
     """Health check: liveness only by default; pass ?comfy=true to include ComfyUI system stats check."""
-    if FOUND_UNHEALTHY and in_flight_requests["total"] == 0:
+    if SHOULD_RESTART_ON_FAILURE and FOUND_UNHEALTHY and in_flight_requests["total"] == 0:
         response.status_code = 502
         logger.error(f"Restart initiated: Health check: unhealthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
         return {
