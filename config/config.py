@@ -90,7 +90,7 @@ RETRY_THRESHOLD = int(os.getenv("RETRY_THRESHOLD", "3"))
 # When true, health check is forced to fail so generate requests always trigger session-close retry
 FORCE_HEALTH_CHECK_FAIL = os.getenv("FORCE_HEALTH_CHECK_FAIL", "true").lower() == "true"
 
-SHOULD_RESTART_ON_FAILURE = os.getenv("SHOULD_RESTART_ON_FAILURE", "false").lower() == "true"
+SHOULD_RESTART_ON_FAILURE = os.getenv("SHOULD_RESTART_ON_FAILURE", "true").lower() == "true"
 
 # Logging Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
