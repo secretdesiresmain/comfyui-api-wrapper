@@ -15,6 +15,7 @@ from anyio import create_task_group
 
 from aiocache import Cache, SimpleMemoryCache
 import time
+import random
 import aiofiles
 import aiohttp
 
@@ -429,22 +430,25 @@ async def generate(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
+    logger.info(f"Generate request received", extra={"request_id": request_id})
     if not ENGINE_NAME:
         set_log_endpoint(extract_endpoint(payload))
 
     # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
-    if FORCE_HEALTH_CHECK_FAIL:
-        is_healthy, health_error = False, "Forced health check failure (FORCE_HEALTH_CHECK_FAIL=true)"
-        logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL", extra={"request_id": request_id})
-    elif FOUND_UNHEALTHY:
+    
+    if FOUND_UNHEALTHY:
         is_healthy, health_error = False, "Instance previously failed a ComfyUI health check during /generate and no requests are in flight. FOUND_UNHEALTHY is True."
-    else:
+    elif FORCE_HEALTH_CHECK_FAIL and random.randint(1, 3) == 1:
+        is_healthy, health_error = False, "Forced health check failure (FORCE_HEALTH_CHECK_FAIL=true, random 1-in-3)"
+        logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL (random 1-in-3 triggered)", extra={"request_id": request_id})
+    else:   
         is_healthy, health_error = await _check_health(request_id)
     if not is_healthy:
+        logger.info(f"Request entered Health Check Failed flow", extra={"request_id": request_id})
         FOUND_UNHEALTHY = True
         current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
         under_threshold = current_retries < RETRY_THRESHOLD
-        logger.info(f"Health check: failed, FOUND_UNHEALTHY set to True. Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
+        logger.info(f"Health check: failed on /generate flow, and Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
         session_close_url = (
             payload.input.webhook.session_close_url
             if payload.input.webhook and payload.input.webhook.session_close_url
@@ -477,6 +481,7 @@ async def generate(
     result_pending = Result(id=request_id)
 
     try:
+        logger.info(f"Request entered Health Check Successful flow", extra={"request_id": request_id})
         # Store request and initial result
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
