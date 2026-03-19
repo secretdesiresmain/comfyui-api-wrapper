@@ -23,6 +23,7 @@ class GenerationWorker:
         self.postprocess_queue = kwargs["postprocess_queue"]
         self.request_store = kwargs["request_store"]
         self.response_store = kwargs["response_store"]
+        self.in_flight_requests = kwargs["in_flight_requests"]
         
         # Configuration
         self.max_wait_time = 3600  # 1 hour maximum wait
@@ -38,10 +39,9 @@ class GenerationWorker:
             # Get a task from the job queue
             request_id = await self.generation_queue.get()
             if request_id is None:
-                # None is a signal that there are no more tasks
                 break
 
-            # Process the job
+            self.in_flight_requests["generation"] += 1
             start_time = time.time()
             comfyui_job_id = None
             is_cached = False
@@ -187,9 +187,9 @@ class GenerationWorker:
                     )
             
             finally:
+                self.in_flight_requests["generation"] -= 1
                 if not ENGINE_NAME:
                     clear_log_endpoint()
-                # Mark the job as complete
                 self.generation_queue.task_done()
 
         logger.info(f"GenerationWorker {self.worker_id} finished", extra={"worker_id": self.worker_id, "worker_type": "generation"})

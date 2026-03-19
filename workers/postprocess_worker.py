@@ -38,6 +38,7 @@ class PostprocessWorker:
         self.postprocess_queue = kwargs["postprocess_queue"]
         self.request_store = kwargs["request_store"]
         self.response_store = kwargs["response_store"]
+        self.in_flight_requests = kwargs["in_flight_requests"]
         
         # Configuration
         self.output_dir = Path(OUTPUT_DIR)
@@ -57,10 +58,9 @@ class PostprocessWorker:
             # Get a task from the job queue
             request_id = await self.postprocess_queue.get()
             if request_id is None:
-                # None is a signal that there are no more tasks
                 break
 
-            # Process the job
+            self.in_flight_requests["postprocess"] += 1
             start_time = time.time()
             s3_uploaded = False
             webhook_sent = False
@@ -172,6 +172,7 @@ class PostprocessWorker:
                     )
             
             finally:
+                self.in_flight_requests["postprocess"] -= 1
                 # Handle webhook - check payload first, then environment variables
                 webhook_config = await self.get_webhook_config(request.input, request_id)
                 if webhook_config:
@@ -221,7 +222,7 @@ class PostprocessWorker:
                     )
                 if not ENGINE_NAME:
                     clear_log_endpoint()
-                # Mark the job as complete
+                self.in_flight_requests["total"] -= 1
                 self.postprocess_queue.task_done()
             
         logger.info(

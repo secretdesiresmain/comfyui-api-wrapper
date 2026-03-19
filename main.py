@@ -15,10 +15,11 @@ from anyio import create_task_group
 
 from aiocache import Cache, SimpleMemoryCache
 import time
+import random
 import aiofiles
 import aiohttp
 
-from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS, RETRY_THRESHOLD, FORCE_HEALTH_CHECK_FAIL
+from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED, CACHE_TTL, COMFYUI_API_SYSTEM_STATS, RETRY_THRESHOLD, FORCE_HEALTH_CHECK_FAIL, SHOULD_RESTART_ON_FAILURE
 from config.logging_config import setup_logging, get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint
 from config.otel_config import setup_otel
 from requestmodels.models import Payload, WebHook
@@ -85,6 +86,10 @@ preprocess_queue = asyncio.Queue()
 generation_queue = asyncio.Queue()
 postprocess_queue = asyncio.Queue()
 
+FOUND_UNHEALTHY: bool = False
+
+in_flight_requests: dict = {"total": 0, "preprocess": 0, "generation": 0, "postprocess": 0}
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -105,6 +110,7 @@ async def main():
         "postprocess_queue": postprocess_queue,
         "request_store": request_store,
         "response_store": response_store,
+        "in_flight_requests": in_flight_requests,
     }
 
     # Create workers using configuration
@@ -347,38 +353,9 @@ async def _check_health(request_id: Optional[str] = None) -> tuple[bool, Optiona
         return False, f"Unexpected error: {type(e).__name__}: {e}"
 
 
-async def _call_session_close_retry(session_close_url: str, payload: Payload) -> None:
-    """
-    POST to the orchestrator's session/close endpoint with retry=true and full input
-    so it can close the session and re-run /generate. Body matches SessionCloseRequest:
-    { session_auth, retry: true, input: { endpoint, request_id, workflow_json, webhook } }.
-    """
-    request_id = payload.input.request_id
-    webhook = payload.input.webhook
-    if not webhook or not getattr(webhook, "session_auth_data", None):
-        logger.warning(
-            "Cannot call session close retry: webhook or session_auth_data missing",
-            extra={"request_id": request_id},
-        )
-        return
-    session_auth = webhook.session_auth_data or {}
-    # Build input shape expected by orchestrator (ImageGenerationInput)
-    input_body = {
-        "endpoint": session_auth.get("endpoint"),
-        "request_id": payload.input.request_id,
-        "workflow_json": payload.input.workflow_json,
-        "webhook": webhook.model_dump() if webhook else None,
-    }
-    body = {
-        "session_auth": session_auth,
-        "retry": True,
-        "input": input_body,
-    }
+async def _fire_session_close_retry(session_close_url: str, body: dict, request_id: str) -> None:
+    """Background task: POST to session/close and log the outcome."""
     try:
-        logger.info(
-            "Calling session close webhook (POST) for retry",
-            extra={"request_id": request_id, "session_close_url": session_close_url},
-        )
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
@@ -403,6 +380,40 @@ async def _call_session_close_retry(session_close_url: str, payload: Payload) ->
         )
 
 
+def _call_session_close(session_close_url: str, payload: Payload, retry: bool = True) -> None:
+    """
+    Fire-and-forget POST to the orchestrator's session/close endpoint.
+    When retry=True the orchestrator will close the session and re-run /generate.
+    When retry=False the orchestrator will just close the session.
+    """
+    request_id = payload.input.request_id
+    webhook = payload.input.webhook
+    if not webhook or not getattr(webhook, "session_auth_data", None):
+        logger.warning(
+            "Cannot call session close: webhook or session_auth_data missing",
+            extra={"request_id": request_id},
+        )
+        return
+    session_auth = webhook.session_auth_data or {}
+    input_body = {
+        "endpoint": session_auth.get("endpoint"),
+        "request_id": payload.input.request_id,
+        "workflow_json": payload.input.workflow_json,
+        "webhook": webhook.model_dump() if webhook else None,
+    }
+    body = {
+        "session_auth": session_auth,
+    }
+    if retry:
+        body["retry"] = True
+        body["input"] = input_body
+    logger.info(
+        f"Firing session close webhook (POST, retry={retry}) (fire-and-forget)",
+        extra={"request_id": request_id, "session_close_url": session_close_url},
+    )
+    asyncio.create_task(_fire_session_close_retry(session_close_url, body, request_id))
+
+
 # ===== ASYNC ENDPOINT (renamed from /payload) =====
 @app.post('/generate', response_model=Result)
 async def generate(
@@ -415,22 +426,29 @@ async def generate(
     ],
 ):
     """Submit a new generation request (async)"""
+    global FOUND_UNHEALTHY
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
+    logger.info(f"Generate request received", extra={"request_id": request_id})
     if not ENGINE_NAME:
         set_log_endpoint(extract_endpoint(payload))
 
     # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
-    if FORCE_HEALTH_CHECK_FAIL:
-        is_healthy, health_error = False, "Forced health check failure (FORCE_HEALTH_CHECK_FAIL=true)"
-        logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL", extra={"request_id": request_id})
-    else:
+    
+    if FOUND_UNHEALTHY:
+        is_healthy, health_error = False, "Instance previously failed a ComfyUI health check during /generate and no requests are in flight. FOUND_UNHEALTHY is True."
+    elif FORCE_HEALTH_CHECK_FAIL and random.randint(1, 3) == 1:
+        is_healthy, health_error = False, "Forced health check failure (FORCE_HEALTH_CHECK_FAIL=true, random 1-in-3)"
+        logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL (random 1-in-3 triggered)", extra={"request_id": request_id})
+    else:   
         is_healthy, health_error = await _check_health(request_id)
     if not is_healthy:
+        logger.info(f"Request entered Health Check Failed flow", extra={"request_id": request_id})
+        FOUND_UNHEALTHY = True
         current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
         under_threshold = current_retries < RETRY_THRESHOLD
-        logger.info(f"Health check: failed, and Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
+        logger.info(f"Health check: failed on /generate flow, and Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
         session_close_url = (
             payload.input.webhook.session_close_url
             if payload.input.webhook and payload.input.webhook.session_close_url
@@ -441,14 +459,16 @@ async def generate(
             and getattr(payload.input.webhook, "session_auth_data", None)
         )
         if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
-            await _call_session_close_retry(session_close_url, payload)
+            _call_session_close(session_close_url, payload, retry=True)
             logger.warning(
-                f"Generate rejected: health check failed for {request_id}: {health_error}, session close retry requested",
+                f"Generate rejected: health check failed for {request_id}: {health_error}, session close with retry requested.",
                 extra={"request_id": request_id},
             )
         else:
+            if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
+                _call_session_close(session_close_url, payload, retry=False)
             logger.error(
-                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}: {health_error}",
+                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}: {health_error}.",
                 extra={"request_id": request_id},
             )
         
@@ -461,10 +481,12 @@ async def generate(
     result_pending = Result(id=request_id)
 
     try:
+        logger.info(f"Request entered Health Check Successful flow", extra={"request_id": request_id})
         # Store request and initial result
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
         await preprocess_queue.put(request_id)
+        in_flight_requests["total"] += 1
         
         logger.info(f"Queued request {request_id}", extra={"request_id": request_id})
         response.status_code = 202
@@ -525,6 +547,7 @@ async def generate_sync(
     await request_store.set(request_id, payload)
     await response_store.set(request_id, result_pending)
     await preprocess_queue.put(request_id)
+    in_flight_requests["total"] += 1
 
     logger.info(f"Queued synchronous request {request_id}", extra={"request_id": request_id})
 
@@ -571,6 +594,7 @@ async def generate_stream(
         await request_store.set(request_id, payload)
         await response_store.set(request_id, result_pending)
         await preprocess_queue.put(request_id)
+        in_flight_requests["total"] += 1
         
         logger.info(f"Starting stream for request {request_id}", extra={"request_id": request_id})
         
@@ -859,37 +883,34 @@ async def queue_info():
 @app.get('/health/', response_model=dict)
 async def health(
     response: Response,
-    comfy: bool = Query(False, description="If true, include ComfyUI system stats check; otherwise only container liveness"),
 ):
     """Health check: liveness only by default; pass ?comfy=true to include ComfyUI system stats check."""
-    health_response = {
+    if SHOULD_RESTART_ON_FAILURE and FOUND_UNHEALTHY and in_flight_requests["total"] == 0:
+        response.status_code = 502
+        logger.error(f"Restart initiated: Health check: unhealthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
+        return {
+            "status": "unhealthy",
+            "reason": "Instance previously failed a ComfyUI health check during /generate and no requests are in flight. FOUND_UNHEALTHY is True.",
+            "cache_type": CACHE_TYPE,
+            "in_flight_requests": in_flight_requests,
+            "queues": {
+                "preprocess": preprocess_queue.qsize(),
+                "generation": generation_queue.qsize(),
+                "postprocess": postprocess_queue.qsize(),
+            },
+        }
+    logger.debug(f"Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
+    
+    if FOUND_UNHEALTHY:
+        logger.info(f"Though FOUND_UNHEALTHY is True, Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
+    
+    return {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
+        "in_flight_requests": in_flight_requests,
         "queues": {
             "preprocess": preprocess_queue.qsize(),
             "generation": generation_queue.qsize(),
             "postprocess": postprocess_queue.qsize(),
-        }
+        },
     }
-
-    if comfy:
-        try:
-            timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(COMFYUI_API_SYSTEM_STATS) as stats_response:
-                    if stats_response.status != 200:
-                        health_response["status"] = "unhealthy"
-                        health_response["comfyui_error"] = f"System stats returned status {stats_response.status}"
-                        response.status_code = 502
-                    else:
-                        health_response["comfyui_system_stats"] = await stats_response.json()
-        except aiohttp.ClientError as e:
-            health_response["status"] = "unhealthy"
-            health_response["comfyui_error"] = f"Failed to connect to ComfyUI: {str(e)}"
-            response.status_code = 502
-        except Exception as e:
-            health_response["status"] = "unhealthy"
-            health_response["comfyui_error"] = f"Unexpected error: {str(e)}"
-            response.status_code = 502
-
-    return health_response

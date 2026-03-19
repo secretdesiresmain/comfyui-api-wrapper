@@ -18,6 +18,7 @@ class PreprocessWorker:
         self.postprocess_queue = kwargs["postprocess_queue"]
         self.request_store = kwargs["request_store"]
         self.response_store = kwargs["response_store"]
+        self.in_flight_requests = kwargs["in_flight_requests"]
 
     async def work(self):
         logger.info(
@@ -28,10 +29,9 @@ class PreprocessWorker:
             # Get a task from the job queue
             request_id = await self.preprocess_queue.get()
             if request_id is None:
-                # None is a signal that there are no more tasks
                 break
 
-            # Process the job
+            self.in_flight_requests["preprocess"] += 1
             start_time = time.time()
             logger.info(
                 f"Processing job: {request_id}",
@@ -128,9 +128,9 @@ class PreprocessWorker:
                     )
             
             finally:
+                self.in_flight_requests["preprocess"] -= 1
                 if not ENGINE_NAME:
                     clear_log_endpoint()
-                # Mark the job as complete
                 self.preprocess_queue.task_done()
             
         logger.info(
