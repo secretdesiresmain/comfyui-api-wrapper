@@ -55,6 +55,7 @@ class WebHook(BaseModel):
     timeout: int = Field(default=30)
     session_auth_data: Optional[Dict] = Field(default=None)
     retries: int = Field(default=0, description="Number of retries (passed through for orchestrator)")
+    fallback_webhook_url: str = Field(default="")
     
     @staticmethod
     def get_defaults():
@@ -64,11 +65,15 @@ class WebHook(BaseModel):
             "extra_params": {},
             "timeout": 30,
             "retries": 0,
+            "fallback_webhook_url": "",
         }
     
     def has_valid_url(self) -> bool:
         """Check if webhook has a valid URL"""
         return self.is_url(self.url)
+
+    def has_valid_fallback_url(self) -> bool:
+        return self.is_url(self.fallback_webhook_url)
     
     @staticmethod
     def is_url(value: str) -> bool:

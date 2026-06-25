@@ -179,7 +179,13 @@ class PostprocessWorker:
                     try:
                         # Send regular webhook if URL is provided
                         if webhook_config.get('url'):
-                            await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}), request_id)
+                            await self.send_webhook(
+                                webhook_config['url'],
+                                result,
+                                webhook_config.get('extra_params', {}),
+                                request_id,
+                                fallback_url=webhook_config.get('fallback_webhook_url'),
+                            )
                             webhook_sent = True
                         
                         # Send session-close webhook if URL is provided
@@ -494,66 +500,103 @@ class PostprocessWorker:
             logger.error(f"Error uploading {local_path}: {e}", extra={"request_id": request_id})
             raise
 
-    async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None, request_id: str = None) -> None:
+    async def send_webhook(
+        self,
+        webhook_url: str,
+        result,
+        extra_params: Dict = None,
+        request_id: str = None,
+        fallback_url: Optional[str] = None,
+    ) -> None:
         """Send webhook notification with result. Retries on network errors and 5xx responses."""
-        timeout = aiohttp.ClientTimeout(total=30)
-        
-        # Prepare webhook payload
         webhook_data = {
             "id": result.id,
             "status": result.status,
             "message": result.message,
             "output": getattr(result, 'output', [])
         }
-        
-        # Add extra parameters if provided
         if extra_params:
             webhook_data.update(extra_params)
-        
+
+        if await self._deliver_webhook(webhook_url, webhook_data, request_id):
+            return
+
+        if not fallback_url:
+            return
+
+        logger.warning(
+            f"Primary webhook failed, trying fallback relay {fallback_url}",
+            extra={"request_id": request_id},
+        )
+        if await self._deliver_webhook(fallback_url, webhook_data, request_id):
+            logger.info(
+                f"Webhook sent via fallback relay {fallback_url}",
+                extra={"request_id": request_id},
+            )
+            return
+
+        logger.error(
+            f"Fallback webhook to {fallback_url} failed after {WEBHOOK_RETRIES} attempts.",
+            extra={"request_id": request_id},
+        )
+
+    async def _deliver_webhook(
+        self,
+        webhook_url: str,
+        webhook_data: Dict,
+        request_id: str = None,
+    ) -> bool:
+        """POST webhook with production retry policy. Returns True on success."""
+        timeout = aiohttp.ClientTimeout(total=30)
         last_error = None
+
         for attempt in range(1, WEBHOOK_RETRIES + 1):
             try:
-                async with aiohttp.ClientSession(timeout=timeout, connector=self._connector, connector_owner=False) as session:
+                async with aiohttp.ClientSession(
+                    timeout=timeout, connector=self._connector, connector_owner=False
+                ) as session:
                     async with session.post(
                         webhook_url,
                         json=webhook_data,
                         headers={'Content-Type': 'application/json'}
                     ) as response:
                         if response.status < 400:
-                            logger.info(f"Webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
-                            return
-                        
+                            logger.info(
+                                f"Webhook sent successfully to {webhook_url}",
+                                extra={"request_id": request_id},
+                            )
+                            return True
+
                         error_text = await response.text()
-                        # 4xx = client error, don't retry
                         if response.status < 500:
-                            logger.warning(f"Webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
-                            return
-                        
-                        # 5xx = server error, retry
+                            logger.warning(
+                                f"Webhook failed (status {response.status}): {error_text}",
+                                extra={"request_id": request_id},
+                            )
+                            return False
+
                         last_error = f"status {response.status}: {error_text}"
                         logger.warning(
                             f"Webhook attempt {attempt}/{WEBHOOK_RETRIES} failed ({last_error})",
-                            extra={"request_id": request_id}
+                            extra={"request_id": request_id},
                         )
             except Exception as e:
                 last_error = str(e)
                 logger.warning(
                     f"Webhook attempt {attempt}/{WEBHOOK_RETRIES} error: {last_error}",
-                    extra={"request_id": request_id}
+                    extra={"request_id": request_id},
                 )
-            
-            # Exponential backoff before next retry (10s, 20s, 40s, …)
+
             if attempt < WEBHOOK_RETRIES:
                 delay = 10 * 2 ** (attempt - 1)
                 await asyncio.sleep(delay)
-        
+
         logger.error(
             f"Webhook to {webhook_url} failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
-            extra={"request_id": request_id}
+            extra={"request_id": request_id},
         )
-        # Don't raise - webhook failures shouldn't fail the whole job
+        return False
 
-    
     async def send_webhook_for_session_close(self, webhook_url: str, result, session_auth_data: Dict = None, request_id: str = None) -> None:
         """Send session-close webhook notification. Retries on network errors and 5xx responses."""
         timeout = aiohttp.ClientTimeout(total=30)
@@ -651,6 +694,8 @@ class PostprocessWorker:
                         'timeout': input_data.webhook.timeout,
                         'session_auth_data': getattr(input_data.webhook, 'session_auth_data', None)
                     }
+                    if input_data.webhook.has_valid_fallback_url():
+                        config_data['fallback_webhook_url'] = input_data.webhook.fallback_webhook_url
                     logger.info(f"Webhook config: {config_data}", extra={"request_id": request_id})
                     return config_data
             
