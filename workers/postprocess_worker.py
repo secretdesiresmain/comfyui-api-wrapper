@@ -571,9 +571,10 @@ class PostprocessWorker:
             put_kwargs["ServerSideEncryption"] = ovh_config["sse"]
         await s3_client.put_object(**put_kwargs)
 
-        # generate_presigned_url performs no network I/O, so aiobotocore leaves it synchronous
-        # even on the async client - it must not be awaited.
-        url = s3_client.generate_presigned_url(
+        # aiobotocore's generate_presigned_url is async (credential refresh / signing).
+        # Without await, a coroutine object is stored as ovh_url and webhook JSON fails with
+        # "Object of type coroutine is not JSON serializable".
+        url = await s3_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": ovh_config["bucket_name"], "Key": key},
             ExpiresIn=ovh_config["presign_expiry_seconds"],
