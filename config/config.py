@@ -48,10 +48,31 @@ S3_CONFIG = {
 
 # Check if S3 is configured via environment
 S3_ENABLED = bool(
-    S3_CONFIG["access_key_id"] and 
-    S3_CONFIG["secret_access_key"] and 
+    S3_CONFIG["access_key_id"] and
+    S3_CONFIG["secret_access_key"] and
     S3_CONFIG["bucket_name"]
 )
+
+# OVH S3-compatible Object Storage configuration (dual-write target during Azure -> OVH migration)
+OVH_CONFIG = {
+    "endpoint_url": os.getenv("OVH_S3_ENDPOINT", ""),
+    "region": os.getenv("OVH_S3_REGION", ""),
+    "access_key_id": os.getenv("OVH_S3_ACCESS_KEY_ID", ""),
+    "secret_access_key": os.getenv("OVH_S3_SECRET_ACCESS_KEY", ""),
+    "bucket_name": os.getenv("OVH_S3_USER_BUCKET", ""),
+    "sse": os.getenv("OVH_S3_SSE", ""),  # e.g. "AES256", blank disables SSE header
+    "presign_expiry_seconds": int(os.getenv("OVH_S3_PRESIGN_EXPIRY_SECONDS", "604800")),  # 7 days
+}
+
+OVH_CONFIGURED = bool(
+    OVH_CONFIG["endpoint_url"] and
+    OVH_CONFIG["access_key_id"] and
+    OVH_CONFIG["secret_access_key"] and
+    OVH_CONFIG["bucket_name"]
+)
+
+# Kill-switch: set to "false" to disable OVH dual-write instantly, independent of whether creds are present
+DUAL_WRITE_OVH_ENABLED = os.getenv("DUAL_WRITE_OVH_ENABLED", "true").lower() == "true" and OVH_CONFIGURED
 
 # Webhook Configuration (fallback from environment)
 WEBHOOK_CONFIG = {

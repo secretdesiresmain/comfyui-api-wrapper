@@ -14,7 +14,11 @@ import aiohttp
 # Azure Blob Storage config (async)
 from azure.storage.blob.aio import ContainerClient
 
-from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
+# OVH S3-compatible Object Storage (async, dual-write)
+from aiobotocore.session import get_session
+from botocore.config import Config as BotoConfig
+
+from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, OVH_CONFIG, DUAL_WRITE_OVH_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
 WEBHOOK_RETRIES: int = WEBHOOK_CONFIG.get("retries", 3)
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
@@ -107,14 +111,26 @@ class PostprocessWorker:
                     
                     # Handle S3 upload - check payload first, then environment variables
                     s3_config = await self.get_s3_config(request.input, request_id)
+
+                    azure_task = None
                     if s3_config:
-                        await self.upload_assets(request_id, s3_config, result)
+                        azure_task = asyncio.create_task(self.upload_assets(request_id, s3_config, result))
                         s3_uploaded = True
                     else:
                         logger.info(
                             f"No S3 configuration found, skipping upload",
                             extra={"request_id": request_id}
                         )
+
+                    # Dual-write to OVH (S3-compatible) alongside Azure - gated by kill-switch
+                    ovh_task = None
+                    if DUAL_WRITE_OVH_ENABLED:
+                        ovh_task = asyncio.create_task(self.upload_assets_to_ovh(request_id, OVH_CONFIG, result))
+
+                    if azure_task:
+                        await azure_task  # unchanged behavior: exceptions here still fail the job
+                    if ovh_task:
+                        await ovh_task  # never raises - see upload_assets_to_ovh docstring
                 else:
                     logger.info(
                         f"No ComfyUI output, likely a failed job",
@@ -493,6 +509,78 @@ class PostprocessWorker:
         except Exception as e:
             logger.error(f"Error uploading {local_path}: {e}", extra={"request_id": request_id})
             raise
+
+    async def upload_assets_to_ovh(self, request_id: str, ovh_config: Dict, result) -> None:
+        """Dual-write assets to OVH. Best-effort: logs and records per-file errors but never
+        raises, so Azure remains the sole source of truth for job success during migration."""
+        if not hasattr(result, 'output') or not result.output:
+            return
+        try:
+            session = get_session()
+            async with session.create_client(
+                "s3",
+                endpoint_url=ovh_config["endpoint_url"],
+                region_name=ovh_config["region"],
+                aws_access_key_id=ovh_config["access_key_id"],
+                aws_secret_access_key=ovh_config["secret_access_key"],
+                config=BotoConfig(signature_version="s3v4"),
+            ) as s3_client:
+                tasks = []
+                for obj in result.output:
+                    local_path = obj.get("local_path")
+                    if local_path and Path(local_path).exists():
+                        task = asyncio.create_task(
+                            self.upload_file_to_ovh_and_get_url(
+                                request_id, s3_client, ovh_config, local_path
+                            )
+                        )
+                        tasks.append(task)
+                    else:
+                        tasks.append(asyncio.create_task(self._return_none()))
+
+                if tasks:
+                    url_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for obj, url_result in zip(result.output, url_results):
+                        if isinstance(url_result, Exception):
+                            logger.error(f"OVH upload failed for {obj.get('local_path')}: {url_result}", extra={"request_id": request_id})
+                            obj["ovh_upload_error"] = str(url_result)
+                        elif url_result:
+                            obj["ovh_url"] = url_result
+
+                    logger.info(
+                        f"Uploaded {len([u for u in url_results if u and not isinstance(u, Exception)])} assets to OVH for {request_id}",
+                        extra={"request_id": request_id}
+                    )
+        except Exception as e:
+            logger.error(f"OVH dual-write failed for {request_id}: {e}", extra={"request_id": request_id})
+            # Intentionally not re-raised - OVH is a dual-write validation target, not the source of truth.
+
+    async def upload_file_to_ovh_and_get_url(self, request_id: str, s3_client, ovh_config: Dict, local_path: str) -> Optional[str]:
+        """Upload single file to OVH and return a presigned GET URL (bucket is private)."""
+        file_path = Path(local_path)
+        key = f"{request_id}_{file_path.name}"
+
+        logger.debug(f"Uploading {key} to OVH", extra={"request_id": request_id})
+
+        async with aiofiles.open(local_path, 'rb') as f:
+            data = await f.read()
+
+        put_kwargs = {"Bucket": ovh_config["bucket_name"], "Key": key, "Body": data}
+        if ovh_config.get("sse"):
+            put_kwargs["ServerSideEncryption"] = ovh_config["sse"]
+        await s3_client.put_object(**put_kwargs)
+
+        # generate_presigned_url performs no network I/O, so aiobotocore leaves it synchronous
+        # even on the async client - it must not be awaited.
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": ovh_config["bucket_name"], "Key": key},
+            ExpiresIn=ovh_config["presign_expiry_seconds"],
+        )
+
+        logger.debug(f"Uploaded OVH URL: {url}", extra={"request_id": request_id})
+        return url
 
     async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None, request_id: str = None) -> None:
         """Send webhook notification with result. Retries on network errors and 5xx responses."""

@@ -206,6 +206,19 @@ S3_ENDPOINT_URL=https://s3.amazonaws.com
 S3_REGION=us-east-1
 ```
 
+### OVH Dual-Write Configuration (Optional)
+Uploads generated assets to OVH S3-compatible Object Storage in addition to the primary S3/Azure upload above. Non-fatal on failure - OVH errors are logged but never fail the job. Set `DUAL_WRITE_OVH_ENABLED=false` to disable instantly regardless of credentials.
+```bash
+DUAL_WRITE_OVH_ENABLED=true
+OVH_S3_ENDPOINT=https://s3.<region>.io.cloud.ovh.us
+OVH_S3_REGION=us-east-va
+OVH_S3_ACCESS_KEY_ID=your-ovh-key
+OVH_S3_SECRET_ACCESS_KEY=your-ovh-secret
+OVH_S3_USER_BUCKET=your-ovh-bucket
+OVH_S3_SSE=AES256                     # optional server-side encryption
+OVH_S3_PRESIGN_EXPIRY_SECONDS=604800  # 7 days - bucket is private, so URLs are presigned
+```
+
 ### Webhook Configuration (Optional)
 ```bash
 WEBHOOK_URL=https://your-webhook.com  # Default webhook URL
