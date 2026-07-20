@@ -18,7 +18,7 @@ from azure.storage.blob.aio import ContainerClient
 from aiobotocore.session import get_session
 from botocore.config import Config as BotoConfig
 
-from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, OVH_CONFIG, DUAL_WRITE_OVH_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
+from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, OVH_CONFIG, OVH_CONFIG_PUBLIC, DUAL_WRITE_OVH_ENABLED, DUAL_WRITE_OVH_PUBLIC_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
 WEBHOOK_RETRIES: int = WEBHOOK_CONFIG.get("retries", 3)
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
@@ -89,7 +89,13 @@ class PostprocessWorker:
                     raise Exception(f"Request {request_id} not found in store")
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
-                
+
+                # Determine which OVH bucket (private vs public) this job's assets belong in.
+                # Read once up front (rather than inside the webhook-sending block later) since
+                # the OVH upload itself needs it before the webhook is ever sent.
+                webhook_config = await self.get_webhook_config(request.input, request_id)
+                is_public_upload = bool(webhook_config and webhook_config.get('is_public'))
+
                 # Set endpoint from request when ENGINE_NAME env var is not set
                 if not ENGINE_NAME:
                     set_log_endpoint(extract_endpoint(request))
@@ -122,15 +128,32 @@ class PostprocessWorker:
                             extra={"request_id": request_id}
                         )
 
-                    # Dual-write to OVH (S3-compatible) alongside Azure - gated by kill-switch
+                    # Dual-write to OVH (S3-compatible) alongside Azure - gated by kill-switch.
+                    # Public jobs (webhook url has isPublic=true, e.g. profile images) go to the
+                    # public bucket and get plain URLs back; everything else keeps going to the
+                    # private bucket with presigned URLs, unchanged from before.
                     ovh_task = None
-                    if DUAL_WRITE_OVH_ENABLED:
-                        ovh_task = asyncio.create_task(self.upload_assets_to_ovh(request_id, OVH_CONFIG, result))
+                    if is_public_upload and DUAL_WRITE_OVH_PUBLIC_ENABLED:
+                        ovh_task = asyncio.create_task(self.upload_assets_to_ovh(request_id, OVH_CONFIG_PUBLIC, result, webhook_config))
+                    elif not is_public_upload and DUAL_WRITE_OVH_ENABLED:
+                        ovh_task = asyncio.create_task(self.upload_assets_to_ovh(request_id, OVH_CONFIG, result, webhook_config))
 
                     if azure_task:
                         await azure_task  # unchanged behavior: exceptions here still fail the job
                     if ovh_task:
                         await ovh_task  # never raises - see upload_assets_to_ovh docstring
+                        # Finalize here (not inside upload_assets_to_ovh) because that task
+                        # runs concurrently with azure_task above - obj["url"] (the Azure
+                        # URL) is only guaranteed populated once azure_task has actually been
+                        # awaited, which happens right above this line.
+                        for obj in result.output:
+                            if "_ovhBucket" in obj:
+                                obj["ovhRef"] = {
+                                    "provider": "ovh",
+                                    "bucket": obj.pop("_ovhBucket"),
+                                    "key": obj.pop("_ovhKey"),
+                                    "azureUrl": obj.get("url", ""),
+                                }
                 else:
                     logger.info(
                         f"No ComfyUI output, likely a failed job",
@@ -510,11 +533,19 @@ class PostprocessWorker:
             logger.error(f"Error uploading {local_path}: {e}", extra={"request_id": request_id})
             raise
 
-    async def upload_assets_to_ovh(self, request_id: str, ovh_config: Dict, result) -> None:
+    async def upload_assets_to_ovh(self, request_id: str, ovh_config: Dict, result, webhook_config: Optional[Dict] = None) -> None:
         """Dual-write assets to OVH. Best-effort: logs and records per-file errors but never
         raises, so Azure remains the sole source of truth for job success during migration."""
         if not hasattr(result, 'output') or not result.output:
             return
+        webhook_config = webhook_config or {}
+        # `${category}/${userId}/...` - same folder layout storageService.writeUserUpload
+        # uses for Ark/Raphael's own dual-write (see ArkImage.provider.js), instead of this
+        # wrapper's own flat `{request_id}_{filename}` scheme. Falls back to `request_id`
+        # alone if the webhook URL didn't carry a `user_id` (e.g. no valid webhook config),
+        # so uploads never fail outright for lack of a folder name.
+        user_id = webhook_config.get('user_id')
+        key_prefix = f"{webhook_config.get('ovh_category', 'generated-page-image')}/{user_id}" if user_id else request_id
         try:
             session = get_session()
             async with session.create_client(
@@ -530,8 +561,8 @@ class PostprocessWorker:
                     local_path = obj.get("local_path")
                     if local_path and Path(local_path).exists():
                         task = asyncio.create_task(
-                            self.upload_file_to_ovh_and_get_url(
-                                request_id, s3_client, ovh_config, local_path
+                            self.upload_file_to_ovh(
+                                request_id, s3_client, ovh_config, local_path, key_prefix
                             )
                         )
                         tasks.append(task)
@@ -539,27 +570,53 @@ class PostprocessWorker:
                         tasks.append(asyncio.create_task(self._return_none()))
 
                 if tasks:
-                    url_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    upload_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    for obj, url_result in zip(result.output, url_results):
-                        if isinstance(url_result, Exception):
-                            logger.error(f"OVH upload failed for {obj.get('local_path')}: {url_result}", extra={"request_id": request_id})
-                            obj["ovh_upload_error"] = str(url_result)
-                        elif url_result:
-                            obj["ovh_url"] = url_result
+                    for obj, upload_result in zip(result.output, upload_results):
+                        if isinstance(upload_result, Exception):
+                            logger.error(f"OVH upload failed for {obj.get('local_path')}: {upload_result}", extra={"request_id": request_id})
+                            obj["ovhUploadError"] = str(upload_result)
+                        elif upload_result:
+                            # Stash the raw bucket/key here (not the final `ovhRef` yet - the
+                            # calling code finalizes that once azure_task has been awaited too,
+                            # so it can fold in the Azure URL as `azureUrl`). Underscore-prefixed
+                            # so they never leak into the webhook payload as-is.
+                            obj["_ovhBucket"] = upload_result["bucket"]
+                            obj["_ovhKey"] = upload_result["key"]
 
                     logger.info(
-                        f"Uploaded {len([u for u in url_results if u and not isinstance(u, Exception)])} assets to OVH for {request_id}",
+                        f"Uploaded {len([u for u in upload_results if u and not isinstance(u, Exception)])} assets to OVH for {request_id}",
                         extra={"request_id": request_id}
                     )
         except Exception as e:
             logger.error(f"OVH dual-write failed for {request_id}: {e}", extra={"request_id": request_id})
             # Intentionally not re-raised - OVH is a dual-write validation target, not the source of truth.
 
-    async def upload_file_to_ovh_and_get_url(self, request_id: str, s3_client, ovh_config: Dict, local_path: str) -> Optional[str]:
-        """Upload single file to OVH and return a presigned GET URL (bucket is private)."""
+    async def upload_file_to_ovh(self, request_id: str, s3_client, ovh_config: Dict, local_path: str, key_prefix: str) -> Optional[Dict]:
+        """Upload a single file to OVH and return its `{bucket, key}` location - not a URL.
+
+        Deliberately hands back the raw pointer instead of resolving a URL here: the calling
+        server (mediaGeneration.service.js -> storageService.resolveReadUrl) already knows,
+        from its own config, which OVH buckets are public vs private and decides at *read*
+        time whether to hand out a stable public URL or a freshly-signed presigned one (with
+        its own TTL policy) - mirroring exactly how it already resolves Ark/Raphael's own
+        dual-writes. Resolving a URL here too would just be a second, redundant, staler
+        (fixed 7-day presign) copy of that same decision.
+
+        Public buckets (ovh_config["is_public"], e.g. profile images) still get
+        ACL=public-read set on the object itself here, since that's an OVH-side concern at
+        write time, independent of how the URL gets resolved later.
+
+        `key_prefix` is `${category}/${userId}` (see upload_assets_to_ovh), giving this
+        object the same folder layout as Ark/Raphael's own dual-write. The basename reuses
+        `request_id` - already a fresh uuid minted once per generation job, no need to mint
+        a second one here - with the original filename appended, since a single job can
+        produce more than one output file (e.g. Monet/Picasso/DaVinci profile jobs write a
+        framed portrait *and* a bg-removed cutout); reusing bare `request_id` for both would
+        collide and overwrite one with the other.
+        """
         file_path = Path(local_path)
-        key = f"{request_id}_{file_path.name}"
+        key = f"{key_prefix}/{request_id}_{file_path.name}"
 
         logger.debug(f"Uploading {key} to OVH", extra={"request_id": request_id})
 
@@ -569,19 +626,17 @@ class PostprocessWorker:
         put_kwargs = {"Bucket": ovh_config["bucket_name"], "Key": key, "Body": data}
         if ovh_config.get("sse"):
             put_kwargs["ServerSideEncryption"] = ovh_config["sse"]
+        if ovh_config.get("is_public"):
+            # S3 ACLs are independent at the bucket level and the object level - a public-read
+            # bucket does NOT make objects public by default, each object still needs its own
+            # ACL set (OVH docs confirm this explicitly). Without this, every uploaded file
+            # would 403 on the plain URL the server later hands out, even though the bucket
+            # itself is public.
+            put_kwargs["ACL"] = "public-read"
         await s3_client.put_object(**put_kwargs)
 
-        # aiobotocore's generate_presigned_url is async (credential refresh / signing).
-        # Without await, a coroutine object is stored as ovh_url and webhook JSON fails with
-        # "Object of type coroutine is not JSON serializable".
-        url = await s3_client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": ovh_config["bucket_name"], "Key": key},
-            ExpiresIn=ovh_config["presign_expiry_seconds"],
-        )
-
-        logger.debug(f"Uploaded OVH URL: {url}", extra={"request_id": request_id})
-        return url
+        logger.debug(f"Uploaded to OVH bucket={ovh_config['bucket_name']} key={key}", extra={"request_id": request_id})
+        return {"bucket": ovh_config["bucket_name"], "key": key}
 
     async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None, request_id: str = None) -> None:
         """Send webhook notification with result. Retries on network errors and 5xx responses."""
@@ -738,7 +793,10 @@ class PostprocessWorker:
                         'session_close_url': input_data.webhook.session_close_url,
                         'extra_params': input_data.webhook.extra_params,
                         'timeout': input_data.webhook.timeout,
-                        'session_auth_data': getattr(input_data.webhook, 'session_auth_data', None)
+                        'session_auth_data': getattr(input_data.webhook, 'session_auth_data', None),
+                        'is_public': input_data.webhook.is_public(),
+                        'ovh_category': input_data.webhook.ovh_category(),
+                        'user_id': input_data.webhook.user_id(),
                     }
                     logger.info(f"Webhook config: {config_data}", extra={"request_id": request_id})
                     return config_data
@@ -751,7 +809,10 @@ class PostprocessWorker:
                     'session_close_url': WEBHOOK_CONFIG.get('session_close_url', ''),
                     'extra_params': {},
                     'timeout': WEBHOOK_CONFIG['timeout'],
-                    'session_auth_data': None
+                    'session_auth_data': None,
+                    'is_public': False,
+                    'ovh_category': 'generated-page-image',
+                    'user_id': '',
                 }
             
             # No valid config found

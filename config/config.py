@@ -53,15 +53,23 @@ S3_ENABLED = bool(
     S3_CONFIG["bucket_name"]
 )
 
-# OVH S3-compatible Object Storage configuration (dual-write target during Azure -> OVH migration)
+# OVH S3-compatible Object Storage configuration (dual-write target during Azure -> OVH migration).
+# Var names/semantics are kept identical to the calling server repo's
+# api/v1/services/storage/config.js - that repo is the source of truth for naming, since it
+# owns the actual bucket layout and read-side resolution. `OVH_S3_AGENT_BUCKET` /
+# `OVH_S3_AGENT_PUBLIC_BUCKET` there are the private/public bucket pair for agent-generated
+# content specifically (as opposed to `OVH_S3_USER_BUCKET`, a separate bucket for the user's
+# *own* uploads) - VastAI/ComfyUI output is always agent-generated, so it belongs on the agent
+# pair, never the user bucket, despite this repo's own env vars historically being named
+# `OVH_S3_USER_BUCKET`/`OVH_S3_PUBLIC_BUCKET`.
 OVH_CONFIG = {
     "endpoint_url": os.getenv("OVH_S3_ENDPOINT", ""),
     "region": os.getenv("OVH_S3_REGION", ""),
     "access_key_id": os.getenv("OVH_S3_ACCESS_KEY_ID", ""),
     "secret_access_key": os.getenv("OVH_S3_SECRET_ACCESS_KEY", ""),
-    "bucket_name": os.getenv("OVH_S3_USER_BUCKET", ""),
+    "bucket_name": os.getenv("OVH_S3_AGENT_BUCKET", ""),
     "sse": os.getenv("OVH_S3_SSE", ""),  # e.g. "AES256", blank disables SSE header
-    "presign_expiry_seconds": int(os.getenv("OVH_S3_PRESIGN_EXPIRY_SECONDS", "604800")),  # 7 days
+    "is_public": False,
 }
 
 OVH_CONFIGURED = bool(
@@ -71,8 +79,30 @@ OVH_CONFIGURED = bool(
     OVH_CONFIG["bucket_name"]
 )
 
-# Kill-switch: set to "false" to disable OVH dual-write instantly, independent of whether creds are present
-DUAL_WRITE_OVH_ENABLED = os.getenv("DUAL_WRITE_OVH_ENABLED", "true").lower() == "true" and OVH_CONFIGURED
+# Public OVH bucket (e.g. profile images) - reuses the same endpoint/region/credentials as the
+# private bucket above, just a different bucket name, since it's the same OVH object storage
+# account. Objects here are expected to be uploaded with a public-read bucket policy on the OVH
+# side, so we return plain (unsigned) URLs instead of presigned ones - AWS SigV4 presigned URLs
+# have a hard 7-day max expiry (X-Amz-Expires), so they can never be "permanent" public links.
+OVH_CONFIG_PUBLIC = {
+    **OVH_CONFIG,
+    "bucket_name": os.getenv("OVH_S3_AGENT_PUBLIC_BUCKET", ""),
+    "is_public": True,
+}
+
+OVH_PUBLIC_CONFIGURED = bool(
+    OVH_CONFIG["endpoint_url"] and
+    OVH_CONFIG["access_key_id"] and
+    OVH_CONFIG["secret_access_key"] and
+    OVH_CONFIG_PUBLIC["bucket_name"]
+)
+
+# Kill-switch: set to "false" to disable OVH dual-write instantly, independent of whether creds
+# are present. Var name/semantics (default-on, disabled only by the literal string "false")
+# mirror the server repo's own `OVH_DUAL_WRITE` kill-switch exactly.
+OVH_DUAL_WRITE = os.getenv("OVH_DUAL_WRITE", "true").lower() != "false"
+DUAL_WRITE_OVH_ENABLED = OVH_DUAL_WRITE and OVH_CONFIGURED
+DUAL_WRITE_OVH_PUBLIC_ENABLED = OVH_DUAL_WRITE and OVH_PUBLIC_CONFIGURED
 
 # Webhook Configuration (fallback from environment)
 WEBHOOK_CONFIG = {
