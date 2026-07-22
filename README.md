@@ -251,6 +251,27 @@ configure a bucket-level public-read policy for this to work - just create the b
 (default private is fine) and point `OVH_S3_AGENT_PUBLIC_BUCKET` at it. Leave it blank to send
 everything to the private bucket regardless of `isPublic`.
 
+### Azure Kill-Switch (Optional)
+Once `OVH_DUAL_WRITE` above has been running healthy for a while, set `AZURE_DUAL_WRITE=false`
+to stop uploading to Azure Blob Storage entirely. Var name/semantics mirror the calling server
+repo's own `AZURE_DUAL_WRITE` flag exactly.
+```bash
+AZURE_DUAL_WRITE=true   # default - unchanged dual-write behavior
+```
+
+With it off:
+- Azure upload is skipped outright; each output item's `url` is persisted as an explicit empty
+  string (never an absent field - the calling server's read paths only special-case a
+  present-but-empty string).
+- OVH becomes the **awaited primary write** instead of a best-effort dual-write target - a
+  connection-level failure, a per-file upload error, or OVH dual-write not being
+  enabled/configured for the bucket the job needs (public vs private) now **fails the job**
+  (raises, so the webhook reports `status: "failed"`), instead of silently completing with a
+  missing image. This mirrors the calling server's own contract: "when Azure writes are off,
+  OVH failures must propagate since there is no fallback left."
+- `ovhRef.azureUrl` is `""` on every output item, same as when Azure is on but a particular
+  upload happened to fail.
+
 To verify an object actually is public after upload:
 ```bash
 aws s3api get-object-acl --bucket <public_bucket> --key <object_key> \

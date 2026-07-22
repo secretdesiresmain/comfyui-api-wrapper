@@ -104,6 +104,13 @@ OVH_DUAL_WRITE = os.getenv("OVH_DUAL_WRITE", "true").lower() != "false"
 DUAL_WRITE_OVH_ENABLED = OVH_DUAL_WRITE and OVH_CONFIGURED
 DUAL_WRITE_OVH_PUBLIC_ENABLED = OVH_DUAL_WRITE and OVH_PUBLIC_CONFIGURED
 
+# Kill-switch: set to "false" to skip the Azure Blob upload entirely (post Azure -> OVH
+# cutover) - once off, OVH becomes the awaited primary write and its failures propagate
+# instead of being swallowed (see upload_assets_to_ovh's `required` param). Var name/
+# semantics (default-on, disabled only by the literal string "false") mirror the server
+# repo's own `AZURE_DUAL_WRITE` flag exactly (api/v1/services/storage/config.js).
+AZURE_DUAL_WRITE = os.getenv("AZURE_DUAL_WRITE", "true").lower() != "false"
+
 # Webhook Configuration (fallback from environment)
 WEBHOOK_CONFIG = {
     "url": os.getenv("WEBHOOK_URL", ""),
