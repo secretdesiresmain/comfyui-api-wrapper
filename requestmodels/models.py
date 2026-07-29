@@ -1,7 +1,7 @@
 import os
 import json
 from typing import List, Union, Dict, Annotated, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from pydantic import BaseModel, Field, validator, model_validator
 
 
@@ -69,6 +69,48 @@ class WebHook(BaseModel):
     def has_valid_url(self) -> bool:
         """Check if webhook has a valid URL"""
         return self.is_url(self.url)
+
+    def query_param(self, name: str, default: str = "") -> str:
+        """Read a single query param off the webhook URL. The caller (this repo's
+        server) encodes everything it needs us to know per-job here (`source`,
+        `user_id`, `char_id`, `isPublic`, `taskId`, ...) rather than adding
+        separate payload fields, so there's only one URL to manage end to end."""
+        try:
+            query = parse_qs(urlparse(self.url).query)
+            return query.get(name, [default])[0]
+        except Exception:
+            return default
+
+    def is_public(self) -> bool:
+        """Whether this job's assets should go to the public OVH bucket.
+
+        Read directly off the `isPublic` query param on the webhook URL. Defaults to
+        False (private) if the param is missing or not exactly "true", so existing
+        callers that don't send it yet keep going to the private bucket unchanged.
+        """
+        return self.query_param("isPublic", "false").strip().lower() == "true"
+
+    def ovh_category(self) -> str:
+        """Storage category for this job's OVH key layout, derived from the `source`
+        query param (`profile` | `chat` | `generate`, same values the server's own
+        `_prepareQueryData`/`_generateWebhookUrl` use). Maps onto the exact same
+        category strings as `storageService.CATEGORIES` in the server repo (see also
+        ArkImage.provider.js's identical `ovhCategory` mapping), so VastAI-generated
+        assets land in the same `${category}/${userId}/${uuid}.${ext}` folder layout
+        as Ark/Raphael's own dual-write instead of a wrapper-specific flat naming
+        scheme. Defaults to "generated-page-image" (private, generate-page route) for
+        any unrecognised/missing source.
+        """
+        return {
+            "profile": "character-profile-image",
+            "chat": "generated-chat-image",
+        }.get(self.query_param("source"), "generated-page-image")
+
+    def user_id(self) -> str:
+        """The owning user's id, read off the `user_id` query param on the webhook
+        URL - forms the folder segment in the OVH key, mirroring
+        storageService.writeUserUpload's `${category}/${userId}/${uuid}.${ext}`."""
+        return self.query_param("user_id")
     
     @staticmethod
     def is_url(value: str) -> bool:

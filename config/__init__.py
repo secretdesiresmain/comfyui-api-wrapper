@@ -25,7 +25,16 @@ from .config import (
     # S3 Configuration
     S3_CONFIG,
     S3_ENABLED,
-    
+
+    # OVH Configuration
+    OVH_CONFIG,
+    OVH_CONFIGURED,
+    DUAL_WRITE_OVH_ENABLED,
+    OVH_CONFIG_PUBLIC,
+    OVH_PUBLIC_CONFIGURED,
+    DUAL_WRITE_OVH_PUBLIC_ENABLED,
+    AZURE_DUAL_WRITE,
+
     # Webhook Configuration
     WEBHOOK_CONFIG,
     WEBHOOK_ENABLED,
@@ -86,6 +95,13 @@ __all__ = [
     'OUTPUT_DIR',
     'S3_CONFIG',
     'S3_ENABLED',
+    'OVH_CONFIG',
+    'OVH_CONFIGURED',
+    'DUAL_WRITE_OVH_ENABLED',
+    'OVH_CONFIG_PUBLIC',
+    'OVH_PUBLIC_CONFIGURED',
+    'DUAL_WRITE_OVH_PUBLIC_ENABLED',
+    'AZURE_DUAL_WRITE',
     'WEBHOOK_CONFIG',
     'WEBHOOK_ENABLED',
     'WORKER_CONFIG',

@@ -206,6 +206,79 @@ S3_ENDPOINT_URL=https://s3.amazonaws.com
 S3_REGION=us-east-1
 ```
 
+### OVH Dual-Write Configuration (Optional)
+Uploads generated assets to OVH S3-compatible Object Storage in addition to the primary S3/Azure upload above. Non-fatal on failure - OVH errors are logged but never fail the job. Set `OVH_DUAL_WRITE=false` to disable instantly regardless of credentials.
+
+Var names below intentionally match the calling server repo's `api/v1/services/storage/config.js`
+exactly - that repo is the source of truth for naming and bucket layout. `OVH_S3_AGENT_BUCKET` /
+`OVH_S3_AGENT_PUBLIC_BUCKET` are its private/public bucket pair for agent-generated content
+specifically (as opposed to its separate `OVH_S3_USER_BUCKET`, used for the user's *own*
+uploads) - this wrapper's output (VastAI/ComfyUI generations) is always agent-generated, so it
+always belongs on the agent pair, never the user bucket, however similarly the two may be named.
+```bash
+OVH_DUAL_WRITE=true
+OVH_S3_ENDPOINT=https://s3.<region>.io.cloud.ovh.us
+OVH_S3_REGION=us-east-va
+OVH_S3_ACCESS_KEY_ID=your-ovh-key
+OVH_S3_SECRET_ACCESS_KEY=your-ovh-secret
+OVH_S3_AGENT_BUCKET=your-ovh-bucket
+OVH_S3_SSE=AES256                     # optional server-side encryption
+OVH_S3_AGENT_PUBLIC_BUCKET=your-public-ovh-bucket  # optional - see below
+```
+
+By default every job's assets go to the private bucket above. If the job's `webhook.url` has
+`isPublic=true` in its query string (e.g. profile image generations), assets are instead
+uploaded to `OVH_S3_AGENT_PUBLIC_BUCKET` with `ACL=public-read` set on each object. Either way,
+this wrapper hands back `{bucket, key}` per asset (not a resolved URL) - the calling server
+resolves that into a public or presigned URL itself, at read time, using its own
+`isPublicBucket()`/TTL policy (see `resolveReadUrl` in `storageService.js`), so there's exactly
+one place that decision is made.
+
+Keys are namespaced as `${category}/${userId}/${request_id}_${filename}`, matching the
+`${category}/${userId}/...` folder layout `storageService.writeUserUpload` uses for this same
+server's own Ark/Raphael dual-write (`character-profile-image` | `generated-chat-image` |
+`generated-page-image`, selected from the webhook URL's `source` query param - see
+`WebHook.ovh_category()`). The basename reuses `request_id` (already a fresh uuid minted once
+per job) instead of minting a second one, with the original filename appended so multiple
+output files from the same job (e.g. a profile job's framed portrait + bg-removed cutout)
+don't collide on the same key. Falls back to a flat `{request_id}/{request_id}_{filename}`
+layout if the webhook URL didn't carry a `user_id`.
+
+Note: S3 ACLs apply independently at the bucket level and the object level - a bucket's own
+ACL does NOT cascade to the objects inside it. Because this code sets `ACL=public-read` on
+every object it uploads to `OVH_S3_AGENT_PUBLIC_BUCKET`, you do **not** need to separately
+configure a bucket-level public-read policy for this to work - just create the bucket normally
+(default private is fine) and point `OVH_S3_AGENT_PUBLIC_BUCKET` at it. Leave it blank to send
+everything to the private bucket regardless of `isPublic`.
+
+### Azure Kill-Switch (Optional)
+Once `OVH_DUAL_WRITE` above has been running healthy for a while, set `AZURE_DUAL_WRITE=false`
+to stop uploading to Azure Blob Storage entirely. Var name/semantics mirror the calling server
+repo's own `AZURE_DUAL_WRITE` flag exactly.
+```bash
+AZURE_DUAL_WRITE=true   # default - unchanged dual-write behavior
+```
+
+With it off:
+- Azure upload is skipped outright; each output item's `url` is persisted as an explicit empty
+  string (never an absent field - the calling server's read paths only special-case a
+  present-but-empty string).
+- OVH becomes the **awaited primary write** instead of a best-effort dual-write target - a
+  connection-level failure, a per-file upload error, or OVH dual-write not being
+  enabled/configured for the bucket the job needs (public vs private) now **fails the job**
+  (raises, so the webhook reports `status: "failed"`), instead of silently completing with a
+  missing image. This mirrors the calling server's own contract: "when Azure writes are off,
+  OVH failures must propagate since there is no fallback left."
+- `ovhRef.azureUrl` is `""` on every output item, same as when Azure is on but a particular
+  upload happened to fail.
+
+To verify an object actually is public after upload:
+```bash
+aws s3api get-object-acl --bucket <public_bucket> --key <object_key> \
+  --endpoint-url https://s3.<region>.io.cloud.ovh.net
+# Look for a Grantee with URI ending in AllUsers and Permission: READ
+```
+
 ### Webhook Configuration (Optional)
 ```bash
 WEBHOOK_URL=https://your-webhook.com  # Default webhook URL
