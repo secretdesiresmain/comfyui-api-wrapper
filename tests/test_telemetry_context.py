@@ -30,3 +30,11 @@ def test_logger_filter_carries_worker_context_without_receipt_secret():
         assert record.user_id=='u'
         assert not hasattr(record,'receipt_token')
     finally:reset(token)
+
+def test_public_result_serialization_never_exposes_callback_receipt_secret():
+    from responses.result import Result
+    token='a'*64
+    result=Result(id='r',telemetry={'execution_attempt_id':'e','receipt_token':token})
+    assert token not in result.model_dump_json()
+    assert token not in str(result.model_dump())
+    assert result.telemetry['receipt_token']==token # internal callback still has proof

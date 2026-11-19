@@ -61,3 +61,22 @@ async def test_upload_failure_preserves_provider_success_but_fails_delivery_resu
     await worker.work()
     assert result.status=='failed'
     assert result.telemetry['provider_status']=='completed'
+
+@pytest.mark.asyncio
+async def test_ambiguous_prompt_post_is_never_repeated_or_logged_with_private_input(monkeypatch,caplog):
+    import workers.generation_worker as module
+    import logging
+    calls=[]
+    class Session:
+        def __init__(self,**kw):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*a):pass
+        def post(self,*a,**kw):calls.append(kw);raise asyncio.TimeoutError()
+    monkeypatch.setattr(module.aiohttp,'ClientSession',Session)
+    monkeypatch.setattr(module.asyncio,'sleep',AsyncMock())
+    worker=GenerationWorker.__new__(GenerationWorker);worker.client_id='client'
+    request=NS(input=NS(workflow_json={'1':{'inputs':{'text':'PRIVATE_PROMPT'}}},telemetry={'receipt_token':'PRIVATE_TOKEN'}))
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(Exception):await worker.post_workflow(request,'r')
+    assert len(calls)==1
+    assert 'PRIVATE_PROMPT' not in caplog.text and 'PRIVATE_TOKEN' not in caplog.text

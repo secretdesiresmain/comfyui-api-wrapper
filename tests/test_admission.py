@@ -38,3 +38,16 @@ async def test_same_execution_id_with_changed_owner_is_rejected(monkeypatch):
     monkeypatch.setattr(main,'response_store',NS(get=AsyncMock(return_value=None)))
     with pytest.raises(HTTPException) as error:await main.generate(Response(),payload())
     assert error.value.status_code==409
+
+@pytest.mark.asyncio
+async def test_public_lookup_and_stream_serialization_hide_receipt_secret(monkeypatch):
+    import httpx
+    from responses.result import Result
+    token='a'*64
+    stored=Result(id='r',telemetry={'receipt_token':token,'execution_attempt_id':'e'})
+    monkeypatch.setattr(main,'response_store',NS(get=AsyncMock(return_value=stored)))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),base_url='http://test') as client:
+        response=await client.get('/result/r')
+    assert response.status_code==200
+    assert token not in response.text and token not in str(main._serialize_result(stored))
+    assert stored.telemetry['receipt_token']==token

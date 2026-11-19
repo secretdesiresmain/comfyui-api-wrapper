@@ -839,6 +839,8 @@ def _result_changed(old_result, new_result) -> bool:
 def _serialize_result(result) -> dict:
     """Convert result object to dictionary for JSON serialization"""
     try:
+        if isinstance(result, Result):
+            return result.model_dump()
         if hasattr(result, '__dict__'):
             # Get all attributes as dict
             result_dict = {}
@@ -846,7 +848,7 @@ def _serialize_result(result) -> dict:
                 try:
                     # Test if value is JSON serializable
                     json.dumps(value)
-                    result_dict[key] = value
+                    result_dict[key] = {k:v for k,v in value.items() if k!='receipt_token'} if key=='telemetry' and isinstance(value,dict) else value
                 except (TypeError, ValueError):
                     # If not serializable, convert to string
                     result_dict[key] = str(value)
