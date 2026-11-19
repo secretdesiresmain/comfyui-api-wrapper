@@ -1,3 +1,5 @@
+from telemetry.store import configured_store
+from telemetry.context import bind, reset, execution_models
 # postprocess_worker
 import asyncio
 import os  # Still needed for symlink and remove operations
@@ -65,6 +67,9 @@ class PostprocessWorker:
                 break
 
             self.in_flight_requests["postprocess"] += 1
+            context_token = bind(None)
+            request = None
+            result = None
             start_time = time.time()
             s3_uploaded = False
             webhook_sent = False
@@ -96,6 +101,8 @@ class PostprocessWorker:
                 webhook_config = await self.get_webhook_config(request.input, request_id)
                 is_public_upload = bool(webhook_config and webhook_config.get('is_public'))
 
+                reset(context_token)
+                context_token = bind(getattr(request.input, 'telemetry', None))
                 # Set endpoint from request when ENGINE_NAME env var is not set
                 if not ENGINE_NAME:
                     set_log_endpoint(extract_endpoint(request))
@@ -107,7 +114,7 @@ class PostprocessWorker:
                         extra={"request_id": request_id, "has_output": True}
                     )
                     logger.info(
-                        f"ComfyUI response structure: {json.dumps(result.comfyui_response, indent=2)[:1000]}",
+                        "ComfyUI result received",
                         extra={"request_id": request_id}
                     )
                     
@@ -181,12 +188,15 @@ class PostprocessWorker:
                     )
                     if hasattr(result, 'comfyui_response'):
                         logger.info(
-                            f"ComfyUI response was: {result.comfyui_response}",
+                            "ComfyUI output unavailable",
                             extra={"request_id": request_id}
                         )
 
                 # Update final status only if not already failed
-                if result.status != "failed":
+                if result.status not in ('failed','cancelled','timeout') and (not result.output or (webhook_config and webhook_config.get('url') and not any(obj.get('url') or obj.get('ovhRef',{}).get('key') for obj in result.output))):
+                    result.status = 'failed'
+                    result.message = 'No usable output'
+                if result.status not in ('failed','cancelled','timeout'):
                     result.status = "completed"
                     result.message = "Processing complete."
                 else:
@@ -200,7 +210,7 @@ class PostprocessWorker:
                 # Log timing
                 duration_ms = (time.time() - start_time) * 1000
                 ErrorMetrics.log_request_timing(
-                    logger, request_id, "postprocess", duration_ms, "success",
+                    logger, request_id, "postprocess", duration_ms, result.status,
                     worker_id=self.worker_id,
                     output_count=output_count,
                     s3_uploaded=s3_uploaded
@@ -233,13 +243,14 @@ class PostprocessWorker:
             finally:
                 self.in_flight_requests["postprocess"] -= 1
                 # Handle webhook - check payload first, then environment variables
-                webhook_config = await self.get_webhook_config(request.input, request_id)
+                webhook_config = await self.get_webhook_config(request.input, request_id) if request else None
                 if webhook_config:
                     try:
                         # Send regular webhook if URL is provided
                         if webhook_config.get('url'):
-                            await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}), request_id)
-                            webhook_sent = True
+                            result.delivery = await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}), request_id)
+                            webhook_sent = result.delivery['delivered']
+                            await self.response_store.set(request_id,result)
                         
                         # Send session-close webhook if URL is provided
                         if webhook_config.get('session_close_url'):
@@ -282,6 +293,7 @@ class PostprocessWorker:
                 if not ENGINE_NAME:
                     clear_log_endpoint()
                 self.in_flight_requests["total"] -= 1
+                reset(context_token)
                 self.postprocess_queue.task_done()
             
         logger.info(
@@ -333,7 +345,7 @@ class PostprocessWorker:
             
             if not outputs:
                 logger.warning(f"No outputs found in ComfyUI response for {request_id}", extra={"request_id": request_id})
-                logger.debug(f"Full response structure: {json.dumps(result.comfyui_response, indent=2)[:2000]}", extra={"request_id": request_id})
+                logger.debug("ComfyUI output structure unavailable", extra={"request_id": request_id})
                 return
             
             # Process each node's outputs
@@ -694,13 +706,19 @@ class PostprocessWorker:
             "id": result.id,
             "status": result.status,
             "message": result.message,
-            "output": getattr(result, 'output', [])
+            "output": getattr(result, 'output', []),
+            "telemetry": getattr(result, 'telemetry', {})
         }
         
         # Add extra parameters if provided
         if extra_params:
-            webhook_data.update(extra_params)
+            webhook_data.update({k:v for k,v in extra_params.items() if k not in webhook_data})
         
+        state = configured_store() if webhook_data['telemetry'].get('execution_attempt_id') else None
+        identity = webhook_data['telemetry'].get('execution_attempt_id', result.id)
+        if state:
+            await state.update('execution', identity, {'status':result.status, 'provider_status':webhook_data['telemetry'].get('provider_status','unknown'), 'resolved':True,'result':webhook_data})
+            await state.claim('delivery',identity,{'delivery_id':identity,'url':webhook_url,'body':webhook_data,'request_id':result.id})
         last_error = None
         for attempt in range(1, WEBHOOK_RETRIES + 1):
             try:
@@ -712,13 +730,15 @@ class PostprocessWorker:
                     ) as response:
                         if response.status < 400:
                             logger.info(f"Webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
-                            return
+                            if state: await state.update('delivery',identity,{'delivered':True})
+                            return {'delivered':True,'attempts':attempt}
                         
                         error_text = await response.text()
                         # 4xx = client error, don't retry
                         if response.status < 500:
                             logger.warning(f"Webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
-                            return
+                            if state: await state.update('delivery',identity,{'resolved':True,'delivered':False,'http_status':response.status})
+                            return {'delivered':False,'attempts':attempt,'http_status':response.status}
                         
                         # 5xx = server error, retry
                         last_error = f"status {response.status}: {error_text}"
@@ -742,7 +762,7 @@ class PostprocessWorker:
             f"Webhook to {webhook_url} failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
             extra={"request_id": request_id}
         )
-        # Don't raise - webhook failures shouldn't fail the whole job
+        return {'delivered':False,'attempts':WEBHOOK_RETRIES,'failure_code':'delivery_exhausted'}
 
     
     async def send_webhook_for_session_close(self, webhook_url: str, result, session_auth_data: Dict = None, request_id: str = None) -> None:
@@ -845,7 +865,7 @@ class PostprocessWorker:
                         'ovh_category': input_data.webhook.ovh_category(),
                         'user_id': input_data.webhook.user_id(),
                     }
-                    logger.info(f"Webhook config: {config_data}", extra={"request_id": request_id})
+                    logger.info("Webhook configuration resolved", extra={"request_id": request_id})
                     return config_data
             
             # Fall back to centralized config (which reads from environment)

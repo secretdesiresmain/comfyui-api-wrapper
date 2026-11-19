@@ -1,3 +1,4 @@
+from telemetry.context import bind, reset, execution_models
 # preprocess_worker
 import importlib
 import time
@@ -32,6 +33,9 @@ class PreprocessWorker:
                 break
 
             self.in_flight_requests["preprocess"] += 1
+            context_token = bind(None)
+            request = None
+            result = None
             start_time = time.time()
             logger.info(
                 f"Processing job: {request_id}",
@@ -53,6 +57,8 @@ class PreprocessWorker:
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
 
+                reset(context_token)
+                context_token = bind(getattr(request.input, 'telemetry', None))
                 # Set endpoint from request when ENGINE_NAME env var is not set
                 if not ENGINE_NAME:
                     set_log_endpoint(extract_endpoint(request))
@@ -68,7 +74,6 @@ class PreprocessWorker:
                         }
                     )
                     await self.postprocess_queue.put(request_id)
-                    self.preprocess_queue.task_done()
                     continue
                 
                 # Get and initialize the workflow modifier
@@ -128,6 +133,7 @@ class PreprocessWorker:
                     )
             
             finally:
+                reset(context_token)
                 self.in_flight_requests["preprocess"] -= 1
                 if not ENGINE_NAME:
                     clear_log_endpoint()
