@@ -7,5 +7,8 @@ class Result(BaseModel):
     status: str = Field(default='pending')
     comfyui_response: Dict = Field(default={})
     output: list = Field(default=[])
-    timings: Dict = Field(default={})
+    timings: Dict = Field(default_factory=dict)
+    telemetry: Dict = Field(default_factory=dict)
+    retry_scheduled: bool = False
+    delivery: Dict = Field(default_factory=dict)
 

@@ -1,3 +1,6 @@
+from telemetry.store import configured_store
+from telemetry.outcomes import classify_history, ExecutionFailure
+from telemetry.context import bind, reset, execution_models
 # generation_worker
 import asyncio
 import aiohttp
@@ -42,6 +45,9 @@ class GenerationWorker:
                 break
 
             self.in_flight_requests["generation"] += 1
+            context_token = bind(None)
+            request = None
+            result = None
             start_time = time.time()
             comfyui_job_id = None
             is_cached = False
@@ -66,6 +72,8 @@ class GenerationWorker:
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
 
+                reset(context_token)
+                context_token = bind(getattr(request.input, 'telemetry', None))
                 # Set endpoint from request when ENGINE_NAME env var is not set
                 if not ENGINE_NAME:
                     set_log_endpoint(extract_endpoint(request))
@@ -81,10 +89,12 @@ class GenerationWorker:
                         }
                     )
                     await self.postprocess_queue.put(request_id)
-                    self.generation_queue.task_done()
                     continue
                     
                 # Submit workflow to ComfyUI
+                result.telemetry = request.input.telemetry.model_dump() if getattr(request.input,'telemetry',None) else {}
+                result.telemetry['submission_attempted'] = True
+                await self.response_store.set(request_id,result)
                 comfyui_job_id = await self.post_workflow(request, request_id)
                 logger.info(
                     f"Submitted job to ComfyUI",
@@ -95,6 +105,11 @@ class GenerationWorker:
                     }
                 )
                 
+                result.telemetry = request.input.telemetry.model_dump() if getattr(request.input, 'telemetry', None) else {}
+                result.telemetry.update(comfyui_prompt_id=comfyui_job_id, submission_attempted=True)
+                state = configured_store() if result.telemetry.get('execution_attempt_id') else None
+                if state:
+                    await state.update('execution', result.telemetry['execution_attempt_id'], {'comfyui_prompt_id':comfyui_job_id, 'status':'generating'})
                 # Update status to show generation started
                 result.status = "generating"
                 result.message = f"Generation started (ComfyUI job: {comfyui_job_id})"
@@ -131,10 +146,14 @@ class GenerationWorker:
                 # Get the final result from ComfyUI history
                 comfyui_response = await self.get_result(comfyui_job_id, request_id)
                 logger.info(
-                    f"ComfyUI response structure: {json.dumps(comfyui_response, indent=2)[:500]}...",
+                    "ComfyUI terminal history received",
                     extra={"request_id": request_id}
                 )
                 
+                if classify_history(comfyui_response, comfyui_job_id) != 'completed':
+                    raise ExecutionFailure('terminal_unconfirmed')
+                result.telemetry.update(execution_models(request.input.workflow_json))
+                result.telemetry.update(provider_status='completed', duration_ms=(time.time()-start_time)*1000)
                 # Update result with success
                 result.status = "generated"
                 result.message = "Generation complete. Queued for post-processing."
@@ -172,7 +191,10 @@ class GenerationWorker:
                     # Update result to show failure
                     result = await self.response_store.get(request_id)
                     if result:
-                        result.status = "failed"
+                        if result.status not in ('cancelled','timeout'):
+                            result.status = 'failed'
+                        result.telemetry = getattr(result,'telemetry',{}) or (request.input.telemetry.model_dump() if request and getattr(request.input,'telemetry',None) else {})
+                        result.telemetry.update(provider_status=result.status if isinstance(e,ExecutionFailure) or result.status in ('cancelled','timeout') else 'unknown', failure_code='execution_failed' if isinstance(e,ExecutionFailure) else 'execution_unconfirmed', failure_stage='generation')
                         result.message = f"Generation failed: {str(e)}"
                         await self.response_store.set(request_id, result)
                     
@@ -187,6 +209,7 @@ class GenerationWorker:
                     )
             
             finally:
+                reset(context_token)
                 self.in_flight_requests["generation"] -= 1
                 if not ENGINE_NAME:
                     clear_log_endpoint()
@@ -293,10 +316,12 @@ class GenerationWorker:
                     if response.status == 200:
                         history_data = await response.json()
                         # If we get non-empty data, the job is complete
-                        if history_data and history_data != {}:
+                        if classify_history(history_data, comfyui_job_id) == 'completed':
                             logger.info(f"Job {comfyui_job_id} found in history (cached)", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                             return True
             return False
+        except ExecutionFailure:
+            raise
         except Exception as e:
             logger.debug(f"Error checking cache status: {e}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
             return False
