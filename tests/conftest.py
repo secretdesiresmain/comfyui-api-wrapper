@@ -5,3 +5,10 @@ for key in ('GRAFANA_HOSTNAME','GRAFANA_APIKEY','GRAFANA_API_KEY','GRAFANA_USERN
     os.environ.pop(key, None)
 os.environ['OUTPUT_DIR']='/tmp/image-observability-test-output'
 os.environ['LOGGING_ENVIRONMENT']='test'
+
+# The tests exercise orchestration without reading image files.
+try:
+    import magic
+except ImportError:
+    from types import ModuleType
+    sys.modules["magic"] = ModuleType("magic")

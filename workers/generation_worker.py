@@ -1,6 +1,3 @@
-from telemetry.store import configured_store
-from telemetry.outcomes import classify_history, ExecutionFailure
-from telemetry.context import bind, reset, execution_models
 # generation_worker
 import asyncio
 import aiohttp
@@ -11,6 +8,8 @@ from datetime import datetime
 
 from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET, COMFYUI_RETRIES
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
+
+from image_observability import log_stage
 
 logger = get_logger(__name__)
 
@@ -45,9 +44,6 @@ class GenerationWorker:
                 break
 
             self.in_flight_requests["generation"] += 1
-            context_token = bind(None)
-            request = None
-            result = None
             start_time = time.time()
             comfyui_job_id = None
             is_cached = False
@@ -72,8 +68,6 @@ class GenerationWorker:
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
 
-                reset(context_token)
-                context_token = bind(getattr(request.input, 'telemetry', None))
                 # Set endpoint from request when ENGINE_NAME env var is not set
                 if not ENGINE_NAME:
                     set_log_endpoint(extract_endpoint(request))
@@ -89,12 +83,10 @@ class GenerationWorker:
                         }
                     )
                     await self.postprocess_queue.put(request_id)
+                    self.generation_queue.task_done()
                     continue
                     
                 # Submit workflow to ComfyUI
-                result.telemetry = request.input.telemetry.model_dump() if getattr(request.input,'telemetry',None) else {}
-                result.telemetry['submission_attempted'] = True
-                await self.response_store.set(request_id,result)
                 comfyui_job_id = await self.post_workflow(request, request_id)
                 logger.info(
                     f"Submitted job to ComfyUI",
@@ -105,11 +97,12 @@ class GenerationWorker:
                     }
                 )
                 
-                result.telemetry = request.input.telemetry.model_dump() if getattr(request.input, 'telemetry', None) else {}
-                result.telemetry.update(comfyui_prompt_id=comfyui_job_id, submission_attempted=True)
-                state = configured_store() if result.telemetry.get('execution_attempt_id') else None
-                if state:
-                    await state.update('execution', result.telemetry['execution_attempt_id'], {'comfyui_prompt_id':comfyui_job_id, 'status':'generating'})
+                metadata = request.input.image_observability
+                if metadata:
+                    log_stage(
+                        logger, metadata, request_id, "comfyui_submission", "accepted",
+                    )
+
                 # Update status to show generation started
                 result.status = "generating"
                 result.message = f"Generation started (ComfyUI job: {comfyui_job_id})"
@@ -146,14 +139,10 @@ class GenerationWorker:
                 # Get the final result from ComfyUI history
                 comfyui_response = await self.get_result(comfyui_job_id, request_id)
                 logger.info(
-                    "ComfyUI terminal history received",
+                    "ComfyUI history retrieved",
                     extra={"request_id": request_id}
                 )
                 
-                if classify_history(comfyui_response, comfyui_job_id) != 'completed':
-                    raise ExecutionFailure('terminal_unconfirmed')
-                result.telemetry.update(execution_models(request.input.workflow_json))
-                result.telemetry.update(provider_status='completed', duration_ms=(time.time()-start_time)*1000)
                 # Update result with success
                 result.status = "generated"
                 result.message = "Generation complete. Queued for post-processing."
@@ -191,10 +180,7 @@ class GenerationWorker:
                     # Update result to show failure
                     result = await self.response_store.get(request_id)
                     if result:
-                        if result.status not in ('cancelled','timeout'):
-                            result.status = 'failed'
-                        result.telemetry = getattr(result,'telemetry',{}) or (request.input.telemetry.model_dump() if request and getattr(request.input,'telemetry',None) else {})
-                        result.telemetry.update(provider_status=result.status if isinstance(e,ExecutionFailure) or result.status in ('cancelled','timeout') else 'unknown', failure_code='execution_failed' if isinstance(e,ExecutionFailure) else 'execution_unconfirmed', failure_stage='generation')
+                        result.status = "failed"
                         result.message = f"Generation failed: {str(e)}"
                         await self.response_store.set(request_id, result)
                     
@@ -209,7 +195,6 @@ class GenerationWorker:
                     )
             
             finally:
-                reset(context_token)
                 self.in_flight_requests["generation"] -= 1
                 if not ENGINE_NAME:
                     clear_log_endpoint()
@@ -218,28 +203,89 @@ class GenerationWorker:
         logger.info(f"GenerationWorker {self.worker_id} finished", extra={"worker_id": self.worker_id, "worker_type": "generation"})
 
     async def post_workflow(self, request, request_id: str = None) -> str:
-        """Submit exactly once: a lost response may already represent queued GPU work."""
-        logger.info("Submitting workflow to ComfyUI", extra={"request_id": request_id})
-        payload = {"prompt": request.input.workflow_json, "client_id": self.client_id}
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-                async with session.post(COMFYUI_API_PROMPT, data=json.dumps(payload), headers={'Content-Type':'application/json'}) as response:
-                    if 400 <= response.status < 500:
-                        raise ExecutionFailure('submission_rejected')
-                    if response.status >= 500:
-                        raise RuntimeError('submission_unconfirmed')
-                    response_data = await response.json()
-                    if response_data.get('prompt_id'):
-                        return response_data['prompt_id']
-                    if response_data.get('node_errors') or response_data.get('error'):
-                        raise ExecutionFailure('submission_rejected')
-                    raise RuntimeError('submission_unconfirmed')
-        except ExecutionFailure:
-            raise
-        except Exception:
-            # Do not include request/workflow, receipt secret or provider response bodies.
-            logger.warning('media_stage_observation', extra={'request_id':request_id,'stage':'generation','failure_code':'submission_unconfirmed','attempt_weight':0})
-            raise RuntimeError('submission_unconfirmed') from None
+        """Submit workflow to ComfyUI API. Retries on network errors and timeouts."""
+        logger.info("Posting workflow to ComfyUI API", extra={"request_id": request_id})
+        payload = {
+            "prompt": request.input.workflow_json,
+            "client_id": self.client_id  # Use our worker's client ID
+        }
+        
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        
+        timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
+        
+        last_error = None
+        for attempt in range(1, COMFYUI_RETRIES + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    logger.info(f"Posting workflow to ComfyUI (attempt {attempt}/{COMFYUI_RETRIES})", extra={"request_id": request_id})
+                    
+                    async with session.post(
+                        COMFYUI_API_PROMPT, 
+                        data=json.dumps(payload),
+                        headers=headers
+                    ) as response:
+                        
+                        response_text = await response.text()
+                        logger.debug(f"ComfyUI API response status: {response.status}", extra={"request_id": request_id})
+                        
+                        # 5xx = ComfyUI server error, retry
+                        if response.status >= 500:
+                            last_error = f"ComfyUI server error (status {response.status}): {response_text}"
+                            logger.warning(
+                                f"ComfyUI post attempt {attempt}/{COMFYUI_RETRIES} failed (HTTP {response.status})",
+                                extra={"request_id": request_id}
+                            )
+                            if attempt < COMFYUI_RETRIES:
+                                delay = 2 ** (attempt - 1)
+                                await asyncio.sleep(delay)
+                                continue
+                            raise Exception(last_error)
+                        
+                        # 4xx = client error, don't retry
+                        if response.status >= 400:
+                            raise aiohttp.ClientResponseError(
+                                request_info=response.request_info,
+                                history=response.history,
+                                status=response.status,
+                                message=f"ComfyUI API error: {response_text}"
+                            )
+                        
+                        response_data = json.loads(response_text)
+                        
+                        if "prompt_id" in response_data:
+                            if attempt > 1:
+                                logger.info(f"ComfyUI post succeeded on attempt {attempt}/{COMFYUI_RETRIES}", extra={"request_id": request_id})
+                            return response_data["prompt_id"]
+                        elif "node_errors" in response_data:
+                            error_details = json.dumps(response_data["node_errors"], indent=2)
+                            raise Exception(f"ComfyUI node errors: {error_details}")
+                        elif "error" in response_data:
+                            raise Exception(f"ComfyUI error: {response_data['error']}")
+                        else:
+                            raise Exception(f"Unexpected response from ComfyUI: {response_data}")
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                # Network errors and timeouts are retryable
+                last_error = str(e)
+                logger.warning(
+                    f"ComfyUI post attempt {attempt}/{COMFYUI_RETRIES} error ({type(e).__name__})",
+                    extra={"request_id": request_id}
+                )
+                if attempt < COMFYUI_RETRIES:
+                    delay = 5 * (2 ** (attempt - 1))  # 5s, 10s, 20s, 40s, …
+                    logger.info(f"Retrying in {delay}s…", extra={"request_id": request_id})
+                    await asyncio.sleep(delay)
+                    continue
+                raise Exception(f"Network error posting to ComfyUI after {COMFYUI_RETRIES} attempts: {last_error}")
+            except json.JSONDecodeError as e:
+                logger.error("Invalid JSON response from ComfyUI", extra={"request_id": request_id})
+                raise Exception(f"Invalid JSON response from ComfyUI: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error posting to ComfyUI ({type(e).__name__})", extra={"request_id": request_id})
+                raise
 
     async def check_if_cached(self, comfyui_job_id: str, request_id: str = None) -> bool:
         """Check if job is already complete (cached result)"""
@@ -253,14 +299,12 @@ class GenerationWorker:
                     if response.status == 200:
                         history_data = await response.json()
                         # If we get non-empty data, the job is complete
-                        if classify_history(history_data, comfyui_job_id) == 'completed':
+                        if history_data and history_data != {}:
                             logger.info(f"Job {comfyui_job_id} found in history (cached)", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                             return True
             return False
-        except ExecutionFailure:
-            raise
         except Exception as e:
-            logger.debug(f"Error checking cache status: {e}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+            logger.debug(f"Error checking cache status ({type(e).__name__})", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
             return False
     
     async def wait_for_completion_websocket(self, comfyui_job_id: str, request_id: str) -> Dict[str, Any]:
@@ -280,7 +324,7 @@ class GenerationWorker:
         
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                logger.info(f"Connecting to ComfyUI WebSocket at {self.ws_url}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                logger.info("Connecting to ComfyUI WebSocket", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                 
                 async with session.ws_connect(
                     self.ws_url,
@@ -385,22 +429,19 @@ class GenerationWorker:
                                         elif message_type == "execution_error":
                                             error_data = data.get("data", {})
                                             error_msg = f"Execution error: {error_data}"
-                                            logger.error(error_msg, extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                                            logger.error("ComfyUI reported an execution error", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                                             execution_result["error"] = error_data
                                             raise Exception(error_msg)
                                         
                                         elif message_type == "executed":
                                             node = data.get("data", {}).get("node")
-                                            output = data.get("data", {}).get("output")
                                             logger.info(f"Node {node} executed successfully", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id, "node": node})
-                                            logger.debug(f"Node output: {json.dumps(output, indent=2)[:500]}...", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                                     
                                 except json.JSONDecodeError as e:
-                                    logger.warning(f"Failed to parse WebSocket message: {e}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
-                                    logger.debug(f"Raw message: {msg.data}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                                    logger.warning(f"Failed to parse WebSocket message ({type(e).__name__})", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                         
                             elif msg.type == aiohttp.WSMsgType.ERROR:
-                                logger.error(f"WebSocket error: {ws.exception()}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                                logger.error("ComfyUI WebSocket error", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                                 raise Exception(f"WebSocket error: {ws.exception()}")
                             
                             elif msg.type == aiohttp.WSMsgType.CLOSED:
@@ -425,7 +466,7 @@ class GenerationWorker:
                                         execution_result["cached"] = True
                                         return execution_result
                                 except Exception as check_error:
-                                    logger.warning(f"Error checking job status: {check_error}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                                    logger.warning(f"Error checking job status ({type(check_error).__name__})", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                                 
                                 # If we've exhausted retries, give up
                                 if no_message_retry_count >= max_no_message_retries:
@@ -451,7 +492,7 @@ class GenerationWorker:
                                         execution_result["completed"] = True
                                         return execution_result
                                 except Exception as check_error:
-                                    logger.warning(f"Error checking job status after timeout: {check_error}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                                    logger.warning(f"Error checking job status after timeout ({type(check_error).__name__})", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                                 
                                 # If still no completion after timeout, raise error
                                 raise Exception(f"WebSocket message timeout for job {comfyui_job_id} "
@@ -471,7 +512,7 @@ class GenerationWorker:
                                 execution_result["completed"] = True
                                 return execution_result
                         except Exception as check_error:
-                            logger.warning(f"Error in final job status check: {check_error}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                            logger.warning(f"Error in final job status check ({type(check_error).__name__})", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                         
                         raise Exception(f"WebSocket closed without completion for job {comfyui_job_id}")
                     
@@ -487,7 +528,7 @@ class GenerationWorker:
             await self.cancel_comfyui_job(comfyui_job_id, request_id)
             raise Exception(f"WebSocket connection error: {e}")
         except Exception as e:
-            logger.error(f"WebSocket error for job {comfyui_job_id}: {e}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+            logger.error(f"WebSocket error for job {comfyui_job_id} ({type(e).__name__})", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
             # Cancel on other errors to be safe
             await self.cancel_comfyui_job(comfyui_job_id, request_id)
             raise
@@ -500,7 +541,7 @@ class GenerationWorker:
                 result.message = message
                 await self.response_store.set(request_id, result)
         except Exception as e:
-            logger.warning(f"Failed to update progress for {request_id}: {e}", extra={"request_id": request_id})
+            logger.warning(f"Failed to update progress for {request_id} ({type(e).__name__})", extra={"request_id": request_id})
 
     async def get_result(self, comfyui_job_id: str, request_id: str = None) -> Optional[dict]:
         """Get the final result from ComfyUI history"""
@@ -512,7 +553,7 @@ class GenerationWorker:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 url = f"{COMFYUI_API_HISTORY}/{comfyui_job_id}"
-                logger.debug(f"Fetching result from: {url}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                logger.debug("Fetching ComfyUI history", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                 
                 async with session.get(url) as response:
                     response_text = await response.text()
@@ -547,7 +588,7 @@ class GenerationWorker:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 # Try the general history endpoint
                 url = COMFYUI_API_HISTORY.rstrip(f"/{comfyui_job_id}")
-                logger.debug(f"Trying general history endpoint: {url}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                logger.debug("Trying general ComfyUI history endpoint", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                 
                 async with session.get(url) as response:
                     if response.status == 200:
@@ -564,7 +605,7 @@ class GenerationWorker:
                         return {}
                         
         except Exception as e:
-            logger.error(f"Failed to get result from general history: {e}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+            logger.error(f"Failed to get result from general history ({type(e).__name__})", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
             return {}
 
     async def _check_if_cancelled(self, request_id: str) -> bool:
@@ -573,7 +614,7 @@ class GenerationWorker:
             result = await self.response_store.get(request_id)
             return result and getattr(result, 'status', '') == 'cancelled'
         except Exception as e:
-            logger.warning(f"Error checking cancellation status for {request_id}: {e}", extra={"request_id": request_id})
+            logger.warning(f"Error checking cancellation status for {request_id} ({type(e).__name__})", extra={"request_id": request_id})
             return False
 
     async def cancel_comfyui_job(self, comfyui_job_id: str, request_id: str = None):
@@ -605,10 +646,10 @@ class GenerationWorker:
                         logger.info(f"Successfully cancelled ComfyUI job {comfyui_job_id}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                         return True
                     else:
-                        response_text = await response.text()
-                        logger.warning(f"Failed to cancel ComfyUI job {comfyui_job_id}: HTTP {response.status} - {response_text}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+                        await response.text()
+                        logger.warning(f"Failed to cancel ComfyUI job {comfyui_job_id}: HTTP {response.status}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
                         return False
                     
         except Exception as e:
-            logger.error(f"Error cancelling ComfyUI job {comfyui_job_id}: {e}", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
+            logger.error(f"Error cancelling ComfyUI job {comfyui_job_id} ({type(e).__name__})", extra={"request_id": request_id, "comfyui_job_id": comfyui_job_id})
             return False

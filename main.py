@@ -1,8 +1,5 @@
-from telemetry.store import configured_store
-from telemetry.context import execution_models
 import asyncio
 import uuid
-import hashlib
 import logging
 import json
 from typing import Annotated, List, Optional
@@ -99,8 +96,6 @@ async def startup_event():
     """Initialize workers on startup"""
     try:
         asyncio.create_task(main())
-        from telemetry.recovery import recovery_loop
-        asyncio.create_task(recovery_loop())
         logger.info("Workers initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize workers: {e}")
@@ -380,7 +375,7 @@ async def _fire_session_close_retry(session_close_url: str, body: dict, request_
                     )
     except Exception as e:
         logger.warning(
-            f"Session close retry webhook call failed: {e}",
+            f"Session close retry webhook call failed ({type(e).__name__})",
             extra={"request_id": request_id},
         )
 
@@ -404,18 +399,19 @@ def _call_session_close(session_close_url: str, payload: Payload, retry: bool = 
         "endpoint": session_auth.get("endpoint"),
         "request_id": payload.input.request_id,
         "workflow_json": payload.input.workflow_json,
-        "telemetry": payload.input.telemetry.model_dump() if payload.input.telemetry else None,
         "webhook": webhook.model_dump() if webhook else None,
     }
     body = {
         "session_auth": session_auth,
     }
     if retry:
+        if payload.input.image_observability:
+            input_body["image_observability"] = payload.input.image_observability
         body["retry"] = True
         body["input"] = input_body
     logger.info(
         f"Firing session close webhook (POST, retry={retry}) (fire-and-forget)",
-        extra={"request_id": request_id, "session_close_url": session_close_url},
+        extra={"request_id": request_id},
     )
     asyncio.create_task(_fire_session_close_retry(session_close_url, body, request_id))
 
@@ -439,28 +435,6 @@ async def generate(
     if not ENGINE_NAME:
         set_log_endpoint(extract_endpoint(payload))
     logger.info(f"Generate request received", extra={"request_id": request_id})
-    telemetry = payload.input.telemetry
-    if telemetry and telemetry.execution_attempt_id:
-        state = configured_store()
-        if not telemetry.job_id or not telemetry.dispatch_id or not telemetry.receipt_token:
-            raise HTTPException(status_code=400, detail='invalid_telemetry_context')
-        if state is None:
-            raise HTTPException(status_code=503, detail='image_telemetry_storage_required')
-        version = execution_models(payload.input.workflow_json)['workflow_version']
-        fingerprint = hashlib.sha256(payload.model_dump_json().encode()).hexdigest()
-        try:
-            fresh = await state.claim('execution', telemetry.execution_attempt_id, {'request_id':request_id, 'job_id':telemetry.job_id, 'execution_attempt_id':telemetry.execution_attempt_id, 'workflow_version':version, 'fingerprint':fingerprint, 'status':'accepted'})
-            if not fresh:
-                previous = await state.read('execution', telemetry.execution_attempt_id)
-                if not previous or previous.get('fingerprint') != fingerprint:
-                    raise HTTPException(status_code=409, detail='execution_payload_conflict')
-                response.status_code = 202
-                return await response_store.get(request_id) or (Result(**previous['result']) if previous.get('result') else Result(id=request_id, status='pending', message='Execution already accepted; reconciling original work'))
-        except HTTPException:
-            raise
-        except Exception:
-            raise HTTPException(status_code=503, detail='image_telemetry_storage_unavailable')
-
 
     # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
     
@@ -471,7 +445,6 @@ async def generate(
         logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL (random 1-in-3 triggered)", extra={"request_id": request_id})
     else:   
         is_healthy, health_error = await _check_health(request_id)
-    retry_scheduled = False
     if not is_healthy:
         logger.info(f"Request entered Health Check Failed flow", extra={"request_id": request_id})
         FOUND_UNHEALTHY = True
@@ -488,17 +461,16 @@ async def generate(
             and getattr(payload.input.webhook, "session_auth_data", None)
         )
         if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
-            retry_scheduled = True
             _call_session_close(session_close_url, payload, retry=True)
             logger.warning(
-                f"Generate rejected: health check failed for {request_id}: {health_error}, session close with retry requested.",
+                f"Generate rejected: health check failed for {request_id}, session close with retry requested.",
                 extra={"request_id": request_id},
             )
         else:
             if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
                 _call_session_close(session_close_url, payload, retry=False)
             logger.error(
-                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}: {health_error}.",
+                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}.",
                 extra={"request_id": request_id},
             )
         
@@ -506,10 +478,9 @@ async def generate(
         return Result(
             id=request_id,
             status="failed",
-            retry_scheduled=retry_scheduled,
             message=f"Service unavailable: {health_error} for request ID : {request_id}",
         )
-    result_pending = Result(id=request_id, telemetry=payload.input.telemetry.model_dump() if payload.input.telemetry else {})
+    result_pending = Result(id=request_id)
 
     try:
         logger.info(f"Request entered Health Check Successful flow", extra={"request_id": request_id})
@@ -523,7 +494,7 @@ async def generate(
         response.status_code = 202
         return result_pending
     except Exception as e:
-        logger.error(f"Failed to queue request {request_id}: {e}", extra={"request_id": request_id})
+        logger.error(f"Failed to queue request {request_id} ({type(e).__name__})", extra={"request_id": request_id})
         response.status_code = 500  # Internal Server Error
         failed_result = Result(
             id=request_id,
@@ -574,16 +545,11 @@ async def generate_sync(
     if not ENGINE_NAME:
         set_log_endpoint(extract_endpoint(payload))
 
-    if payload.input.telemetry:
-        admitted = await generate(response, payload)
-        if admitted.status in ('failed','completed','timeout','cancelled'):
-            return admitted
-    else:
-        result_pending = Result(id=request_id)
-        await request_store.set(request_id, payload)
-        await response_store.set(request_id, result_pending)
-        await preprocess_queue.put(request_id)
-        in_flight_requests["total"] += 1
+    result_pending = Result(id=request_id)
+    await request_store.set(request_id, payload)
+    await response_store.set(request_id, result_pending)
+    await preprocess_queue.put(request_id)
+    in_flight_requests["total"] += 1
 
     logger.info(f"Queued synchronous request {request_id}", extra={"request_id": request_id})
 
@@ -623,19 +589,14 @@ async def generate_stream(
     if not ENGINE_NAME:
         set_log_endpoint(extract_endpoint(payload))
     
-    result_pending = Result(id=request_id, telemetry=payload.input.telemetry.model_dump() if payload.input.telemetry else {})
+    result_pending = Result(id=request_id)
 
     try:
         # Store request and initial result
-        if payload.input.telemetry:
-            admitted = await generate(Response(), payload)
-            if admitted.status in ('failed','completed','timeout','cancelled'):
-                return JSONResponse(content=admitted.model_dump())
-        else:
-            await request_store.set(request_id, payload)
-            await response_store.set(request_id, result_pending)
-            await preprocess_queue.put(request_id)
-            in_flight_requests["total"] += 1
+        await request_store.set(request_id, payload)
+        await response_store.set(request_id, result_pending)
+        await preprocess_queue.put(request_id)
+        in_flight_requests["total"] += 1
         
         logger.info(f"Starting stream for request {request_id}", extra={"request_id": request_id})
         
@@ -839,8 +800,6 @@ def _result_changed(old_result, new_result) -> bool:
 def _serialize_result(result) -> dict:
     """Convert result object to dictionary for JSON serialization"""
     try:
-        if isinstance(result, Result):
-            return result.model_dump()
         if hasattr(result, '__dict__'):
             # Get all attributes as dict
             result_dict = {}
@@ -848,7 +807,7 @@ def _serialize_result(result) -> dict:
                 try:
                     # Test if value is JSON serializable
                     json.dumps(value)
-                    result_dict[key] = {k:v for k,v in value.items() if k!='receipt_token'} if key=='telemetry' and isinstance(value,dict) else value
+                    result_dict[key] = value
                 except (TypeError, ValueError):
                     # If not serializable, convert to string
                     result_dict[key] = str(value)

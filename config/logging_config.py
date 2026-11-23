@@ -1,4 +1,3 @@
-from telemetry.context import current as media_context
 """
 Logging configuration with Grafana Loki + OpenTelemetry integration.
 
@@ -90,8 +89,6 @@ class TraceContextFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        for key,value in media_context().items():
-            if not hasattr(record,key):setattr(record,key,value)
         if OTEL_TRACE_AVAILABLE:
             span = otel_trace.get_current_span()
             ctx = span.get_span_context() if span else None
@@ -519,16 +516,14 @@ class ErrorMetrics:
         error_data = {
             "error_category": category,
             "error_type": type(error).__name__,
-            "error_message": str(error),
         }
         if request_id:
             error_data["request_id"] = request_id
         error_data.update(extra)
         
         logger.error(
-            f"[{category}] {type(error).__name__}: {error}",
-            extra=error_data,
-            exc_info=True
+            f"[{category}] {type(error).__name__}",
+            extra=error_data
         )
     
     @staticmethod

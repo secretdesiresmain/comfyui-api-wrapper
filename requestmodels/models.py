@@ -4,6 +4,8 @@ from typing import List, Union, Dict, Annotated, Optional
 from urllib.parse import urlparse, parse_qs
 from pydantic import BaseModel, Field, validator, model_validator
 
+from image_observability import ImageObservability
+
 
 class S3Config(BaseModel):
     access_key_id: str = Field(default="")
@@ -122,11 +124,9 @@ class WebHook(BaseModel):
             return False
 
 
-from telemetry.context import Telemetry
-
 class Input(BaseModel):
-    telemetry: Optional[Telemetry] = None
     request_id: str = Field(default="")
+    image_observability: ImageObservability = None
     modifier: str = Field(default="")
     modifications: Dict = Field(default_factory=dict)
     workflow_json: Dict = Field(default_factory=dict)

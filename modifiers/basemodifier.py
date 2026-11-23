@@ -100,7 +100,7 @@ class BaseModifier:
                     return data
                 data = await self.get_url_content(data)
             except Exception as e:
-                logger.error(f"Failed to download URL {data}: {e}")
+                logger.error(f"Failed to resolve workflow asset ({type(e).__name__})")
                 raise
         return data
             
@@ -115,11 +115,11 @@ class BaseModifier:
             filename_without_extension
         )
         if existing_file:
-            logger.info(f"Using cached file for {url}: {existing_file.name}")
+            logger.info(f"Using cached workflow asset {existing_file.name}")
             return existing_file.name
         else:
             file_path = await self.download_file(url, self.input_dir)
-            logger.info(f"Downloaded {url} to {file_path.name}")
+            logger.info(f"Downloaded workflow asset {file_path.name}")
             return file_path.name
     
     def is_url(self, value):
@@ -177,13 +177,13 @@ class BaseModifier:
                     
                     temp_filepath.rename(final_filepath)
                     
-                    logger.info(f"Downloaded {url} to {final_filepath}")
+                    logger.info(f"Saved workflow asset to {final_filepath}")
                     return final_filepath
                     
         except Exception as e:
             if temp_filepath is not None and temp_filepath.exists():
                 temp_filepath.unlink()
-            logger.error(f"Failed to download {url}: {e}")
+            logger.error(f"Failed to download workflow asset ({type(e).__name__})")
             raise
     
     async def find_input_file(self, directory, filename_without_extension):
