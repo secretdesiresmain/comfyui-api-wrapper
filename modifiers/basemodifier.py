@@ -21,7 +21,7 @@ class BaseModifier:
     RANDOM_INT_PLACEHOLDER = "__RANDOM_INT__"
     RANDOM_INT_MIN = 0
     RANDOM_INT_MAX = 2**32 - 1
-    MEDIA_PROXY_HOST = "media.secretdesires.ai"
+    MEDIA_PROXY_DOMAIN = ".secretdesires.ai"
     MEDIA_PROXY_USER_AGENT = "Mozilla/5.0 (compatible; SDMediaFetcher/1.0)"
   
     def __init__(self, modifications=None):
@@ -135,8 +135,9 @@ class BaseModifier:
         return hashlib.md5(url.encode()).hexdigest()
 
     def get_download_headers(self, url):
-        """Provide a Cloudflare-compatible UA only for our media proxy."""
-        if urlparse(url).hostname == self.MEDIA_PROXY_HOST:
+        """Provide a Cloudflare-compatible UA for our subdomains."""
+        hostname = urlparse(url).hostname
+        if hostname and hostname.endswith(self.MEDIA_PROXY_DOMAIN):
             return {"User-Agent": self.MEDIA_PROXY_USER_AGENT}
         return None
     
