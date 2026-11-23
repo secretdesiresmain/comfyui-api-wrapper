@@ -32,8 +32,13 @@ def log_stage(logger: logging.Logger, metadata: ImageObservability, request_id: 
               stage: str, status: str, **details) -> None:
     """An observation failure must never affect the observed operation."""
     try:
+        context = project(metadata) or {}
+        # request_id belongs to the existing worker dispatch/logging context.
+        # Retain the originating HTTP request separately when task IDs differ.
+        origin = context.pop("request_id", None)
         logger.info("Image worker stage", extra={
-            **(metadata or {}),
+            **context,
+            **({"server_request_id": origin} if origin else {}),
             "request_id": request_id,
             "stage": stage,
             "status": status,

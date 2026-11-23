@@ -122,3 +122,16 @@ async def test_workflow_asset_lookup_does_not_log_signed_url(monkeypatch, caplog
         assert await modifier.get_url_content(
             "https://example.test/image.png?signature=PRIVATE-SIGNED-URL") == "cached.png"
     assert "PRIVATE-SIGNED-URL" not in caplog.text
+
+
+def test_worker_diagnostics_keep_original_request_and_dispatch_ids(caplog):
+    import logging
+    from image_observability import log_stage
+    logger = logging.getLogger("image-observability-correlation-test")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    log_stage(logger, {"request_id": "server-request", "trace_id": "trace", "job_id": "job"},
+              "dispatch-task", "dispatch", "accepted")
+    record = caplog.records[-1]
+    assert record.request_id == "dispatch-task"
+    assert record.server_request_id == "server-request"
+    assert record.trace_id == "trace"
