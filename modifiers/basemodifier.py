@@ -21,6 +21,8 @@ class BaseModifier:
     RANDOM_INT_PLACEHOLDER = "__RANDOM_INT__"
     RANDOM_INT_MIN = 0
     RANDOM_INT_MAX = 2**32 - 1
+    MEDIA_PROXY_DOMAIN = ".secretdesires.ai"
+    MEDIA_PROXY_USER_AGENT = "Mozilla/5.0 (compatible; SDMediaFetcher/1.0)"
   
     def __init__(self, modifications=None):
         self.modifications = modifications or {}
@@ -131,6 +133,13 @@ class BaseModifier:
     def get_url_hash(self, url):
         """Generate MD5 hash for URL"""
         return hashlib.md5(url.encode()).hexdigest()
+
+    def get_download_headers(self, url):
+        """Provide a Cloudflare-compatible UA for our subdomains."""
+        hostname = urlparse(url).hostname
+        if hostname and hostname.endswith(self.MEDIA_PROXY_DOMAIN):
+            return {"User-Agent": self.MEDIA_PROXY_USER_AGENT}
+        return None
     
     async def download_file(self, url, target_dir):
         """Download file from URL to target directory using a unique temp file to avoid race conditions"""
@@ -143,8 +152,9 @@ class BaseModifier:
             # Use a unique temp filename to prevent concurrent downloads from colliding
             temp_filepath = target_dir / f"{file_name_hash}.tmp.{uuid.uuid4().hex[:8]}"
             
+            headers = self.get_download_headers(url)
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
+                async with session.get(url, headers=headers) as response:
                     if response.status >= 400:
                         raise aiohttp.ClientResponseError(
                             request_info=response.request_info,

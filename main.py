@@ -430,9 +430,9 @@ async def generate(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    logger.info(f"Generate request received", extra={"request_id": request_id})
     if not ENGINE_NAME:
         set_log_endpoint(extract_endpoint(payload))
+    logger.info(f"Generate request received", extra={"request_id": request_id})
 
     # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
     
@@ -900,7 +900,10 @@ async def health(
             },
         }
     logger.debug(f"Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
-
+    
+    if FOUND_UNHEALTHY:
+        logger.info(f"Though FOUND_UNHEALTHY is True, Health check: healthy, in_flight_requests: {in_flight_requests} and queues: {preprocess_queue.qsize(), generation_queue.qsize(), postprocess_queue.qsize()} and FOUND_UNHEALTHY: {FOUND_UNHEALTHY}", extra={"request_id": None})
+    
     return {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
