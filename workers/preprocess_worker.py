@@ -4,6 +4,8 @@ import time
 from modifiers.basemodifier import BaseModifier
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
+from image_observability import log_stage
+
 logger = get_logger(__name__)
 
 
@@ -52,6 +54,10 @@ class PreprocessWorker:
                     raise Exception(f"Request {request_id} not found in store")
                 if not result:
                     raise Exception(f"Result {request_id} not found in store")
+
+                metadata = request.input.image_observability
+                if metadata:
+                    log_stage(logger, metadata, request_id, "preprocess", "started")
 
                 # Set endpoint from request when ENGINE_NAME env var is not set
                 if not ENGINE_NAME:

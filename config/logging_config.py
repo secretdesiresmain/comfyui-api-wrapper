@@ -516,16 +516,14 @@ class ErrorMetrics:
         error_data = {
             "error_category": category,
             "error_type": type(error).__name__,
-            "error_message": str(error),
         }
         if request_id:
             error_data["request_id"] = request_id
         error_data.update(extra)
         
         logger.error(
-            f"[{category}] {type(error).__name__}: {error}",
-            extra=error_data,
-            exc_info=True
+            f"[{category}] {type(error).__name__}",
+            extra=error_data
         )
     
     @staticmethod

@@ -5,7 +5,6 @@ import shutil
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
-import json
 
 import aiofiles
 import aiofiles.os
@@ -21,6 +20,8 @@ from botocore.config import Config as BotoConfig
 from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, OVH_CONFIG, OVH_CONFIG_PUBLIC, DUAL_WRITE_OVH_ENABLED, DUAL_WRITE_OVH_PUBLIC_ENABLED, AZURE_DUAL_WRITE, WEBHOOK_CONFIG, WEBHOOK_ENABLED
 WEBHOOK_RETRIES: int = WEBHOOK_CONFIG.get("retries", 3)
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
+
+from image_observability import ImageObservability, log_stage, project
 
 logger = get_logger(__name__)
 
@@ -107,7 +108,7 @@ class PostprocessWorker:
                         extra={"request_id": request_id, "has_output": True}
                     )
                     logger.info(
-                        f"ComfyUI response structure: {json.dumps(result.comfyui_response, indent=2)[:1000]}",
+                        "ComfyUI result received",
                         extra={"request_id": request_id}
                     )
                     
@@ -181,7 +182,7 @@ class PostprocessWorker:
                     )
                     if hasattr(result, 'comfyui_response'):
                         logger.info(
-                            f"ComfyUI response was: {result.comfyui_response}",
+                            "ComfyUI output unavailable",
                             extra={"request_id": request_id}
                         )
 
@@ -238,7 +239,10 @@ class PostprocessWorker:
                     try:
                         # Send regular webhook if URL is provided
                         if webhook_config.get('url'):
-                            await self.send_webhook(webhook_config['url'], result, webhook_config.get('extra_params', {}), request_id)
+                            await self.send_webhook(
+                                webhook_config['url'], result, webhook_config.get('extra_params', {}),
+                                request_id, image_observability=request.input.image_observability,
+                            )
                             webhook_sent = True
                         
                         # Send session-close webhook if URL is provided
@@ -248,10 +252,7 @@ class PostprocessWorker:
                                 session_auth_data = {}
                             logger.info(
                                 f"Sending session close webhook",
-                                extra={
-                                    "request_id": request_id,
-                                    "session_close_url": webhook_config['session_close_url']
-                                }
+                                extra={"request_id": request_id}
                             )
                             await self.send_webhook_for_session_close(webhook_config['session_close_url'], result, session_auth_data, request_id)
                     except Exception as webhook_error:
@@ -259,8 +260,7 @@ class PostprocessWorker:
                         ErrorMetrics.log_error(
                             logger, webhook_error, "webhook",
                             request_id=request_id,
-                            worker_id=self.worker_id,
-                            webhook_url=webhook_config.get('url', '')
+                            worker_id=self.worker_id
                         )
                 else:
                     logger.info(
@@ -333,7 +333,7 @@ class PostprocessWorker:
             
             if not outputs:
                 logger.warning(f"No outputs found in ComfyUI response for {request_id}", extra={"request_id": request_id})
-                logger.debug(f"Full response structure: {json.dumps(result.comfyui_response, indent=2)[:2000]}", extra={"request_id": request_id})
+                logger.debug("ComfyUI output structure unavailable", extra={"request_id": request_id})
                 return
             
             # Process each node's outputs
@@ -375,7 +375,7 @@ class PostprocessWorker:
             logger.info(f"Processed {len(processed_files)} output files for {request_id}", extra={"request_id": request_id})
             
         except Exception as e:
-            logger.error(f"Error moving assets for {request_id}: {e}", extra={"request_id": request_id}, exc_info=True)
+            logger.error(f"Error moving assets for {request_id} ({type(e).__name__})", extra={"request_id": request_id})
             raise
 
     async def _process_output_file(self, item: Dict, job_output_dir: Path, request_id: str, node_id: str, output_type: str) -> Optional[Dict]:
@@ -386,7 +386,7 @@ class PostprocessWorker:
             file_type = item.get('type', 'output')
             
             if not filename:
-                logger.warning(f"No filename in output item: {item}", extra={"request_id": request_id})
+                logger.warning("No filename in output item", extra={"request_id": request_id})
                 return None
             
             # Construct the original file path
@@ -441,7 +441,7 @@ class PostprocessWorker:
             }
             
         except Exception as e:
-            logger.error(f"Error processing output file {item}: {e}", extra={"request_id": request_id}, exc_info=True)
+            logger.error(f"Error processing output file ({type(e).__name__})", extra={"request_id": request_id})
             return None
 
     async def _copy_file_async(self, src: Path, dst: Path) -> None:
@@ -508,7 +508,7 @@ class PostprocessWorker:
                 # Update result objects with URLs
                 for obj, url_result in zip(result.output, presigned_urls):
                     if isinstance(url_result, Exception):
-                        logger.error(f"Upload failed for {obj.get('local_path')}: {url_result}", extra={"request_id": request_id})
+                        logger.error(f"Upload failed ({type(url_result).__name__})", extra={"request_id": request_id})
                         obj["upload_error"] = str(url_result)
                     elif url_result:
                         obj["url"] = url_result
@@ -516,7 +516,7 @@ class PostprocessWorker:
                 logger.info(f"Uploaded {len([u for u in presigned_urls if u and not isinstance(u, Exception)])} assets for {request_id}", extra={"request_id": request_id})
                     
         except Exception as e:
-            logger.error(f"Error uploading assets for {request_id}: {e}", extra={"request_id": request_id})
+            logger.error(f"Error uploading assets for {request_id} ({type(e).__name__})", extra={"request_id": request_id})
             raise
         finally:
             # Close the container client to release connections
@@ -546,11 +546,11 @@ class PostprocessWorker:
             # Get the blob URL
             blob_url = blob_client.url
             
-            logger.debug(f"Uploaded blob URL: {blob_url}", extra={"request_id": request_id})
+            logger.debug("Blob uploaded", extra={"request_id": request_id})
             return blob_url
             
         except Exception as e:
-            logger.error(f"Error uploading {local_path}: {e}", extra={"request_id": request_id})
+            logger.error(f"Error uploading {local_path} ({type(e).__name__})", extra={"request_id": request_id})
             raise
 
     async def upload_assets_to_ovh(self, request_id: str, ovh_config: Dict, result, webhook_config: Optional[Dict] = None, *, required: bool = False) -> None:
@@ -605,7 +605,7 @@ class PostprocessWorker:
 
                     for obj, upload_result in zip(result.output, upload_results):
                         if isinstance(upload_result, Exception):
-                            logger.error(f"OVH upload failed for {obj.get('local_path')}: {upload_result}", extra={"request_id": request_id})
+                            logger.error(f"OVH upload failed ({type(upload_result).__name__})", extra={"request_id": request_id})
                             obj["ovhUploadError"] = str(upload_result)
                             first_error = first_error or upload_result
                         elif upload_result:
@@ -631,7 +631,7 @@ class PostprocessWorker:
                     if required and first_error:
                         raise first_error
         except Exception as e:
-            logger.error(f"OVH dual-write failed for {request_id}: {e}", extra={"request_id": request_id})
+            logger.error(f"OVH dual-write failed for {request_id} ({type(e).__name__})", extra={"request_id": request_id})
             if required:
                 # AZURE_DUAL_WRITE is off - OVH is the awaited primary write, so its failure
                 # must propagate and fail the job (no Azure fallback left to fall back on).
@@ -685,7 +685,15 @@ class PostprocessWorker:
         logger.debug(f"Uploaded to OVH bucket={ovh_config['bucket_name']} key={key}", extra={"request_id": request_id})
         return {"bucket": ovh_config["bucket_name"], "key": key}
 
-    async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None, request_id: str = None) -> None:
+    async def send_webhook(
+        self,
+        webhook_url: str,
+        result,
+        extra_params: Dict = None,
+        request_id: str = None,
+        *,
+        image_observability: ImageObservability = None,
+    ) -> None:
         """Send webhook notification with result. Retries on network errors and 5xx responses."""
         timeout = aiohttp.ClientTimeout(total=30)
         
@@ -701,6 +709,11 @@ class PostprocessWorker:
         if extra_params:
             webhook_data.update(extra_params)
         
+        metadata = project(image_observability)
+        if metadata:
+            webhook_data["image_observability"] = metadata
+            log_stage(logger, metadata, request_id, "callback", "started")
+
         last_error = None
         for attempt in range(1, WEBHOOK_RETRIES + 1):
             try:
@@ -711,23 +724,23 @@ class PostprocessWorker:
                         headers={'Content-Type': 'application/json'}
                     ) as response:
                         if response.status < 400:
-                            logger.info(f"Webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
+                            logger.info("Webhook sent successfully", extra={"request_id": request_id})
                             return
                         
-                        error_text = await response.text()
+                        await response.text()
                         # 4xx = client error, don't retry
                         if response.status < 500:
-                            logger.warning(f"Webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
+                            logger.warning(f"Webhook failed (status {response.status})", extra={"request_id": request_id})
                             return
                         
                         # 5xx = server error, retry
-                        last_error = f"status {response.status}: {error_text}"
+                        last_error = f"HTTP {response.status}"
                         logger.warning(
                             f"Webhook attempt {attempt}/{WEBHOOK_RETRIES} failed ({last_error})",
                             extra={"request_id": request_id}
                         )
             except Exception as e:
-                last_error = str(e)
+                last_error = type(e).__name__
                 logger.warning(
                     f"Webhook attempt {attempt}/{WEBHOOK_RETRIES} error: {last_error}",
                     extra={"request_id": request_id}
@@ -739,7 +752,7 @@ class PostprocessWorker:
                 await asyncio.sleep(delay)
         
         logger.error(
-            f"Webhook to {webhook_url} failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
+            f"Webhook failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
             extra={"request_id": request_id}
         )
         # Don't raise - webhook failures shouldn't fail the whole job
@@ -771,23 +784,23 @@ class PostprocessWorker:
                         headers={'Content-Type': 'application/json'}
                     ) as response:
                         if response.status < 400:
-                            logger.info(f"Session close webhook sent successfully to {webhook_url}", extra={"request_id": request_id})
+                            logger.info("Session close webhook sent successfully", extra={"request_id": request_id})
                             return
                         
-                        error_text = await response.text()
+                        await response.text()
                         # 4xx = client error, don't retry
                         if response.status < 500:
-                            logger.warning(f"Session close webhook failed (status {response.status}): {error_text}", extra={"request_id": request_id})
+                            logger.warning(f"Session close webhook failed (status {response.status})", extra={"request_id": request_id})
                             return
                         
                         # 5xx = server error, retry
-                        last_error = f"status {response.status}: {error_text}"
+                        last_error = f"HTTP {response.status}"
                         logger.warning(
                             f"Session close webhook attempt {attempt}/{WEBHOOK_RETRIES} failed ({last_error})",
                             extra={"request_id": request_id}
                         )
             except Exception as e:
-                last_error = str(e)
+                last_error = type(e).__name__
                 logger.warning(
                     f"Session close webhook attempt {attempt}/{WEBHOOK_RETRIES} error: {last_error}",
                     extra={"request_id": request_id}
@@ -799,7 +812,7 @@ class PostprocessWorker:
                 await asyncio.sleep(delay)
         
         logger.error(
-            f"Session close webhook to {webhook_url} failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
+            f"Session close webhook failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
             extra={"request_id": request_id}
         )
         # Don't raise - webhook failures shouldn't fail the whole job
@@ -825,7 +838,7 @@ class PostprocessWorker:
             return None
             
         except Exception as e:
-            logger.error(f"Error getting S3 config: {e}", extra={"request_id": request_id})
+            logger.error(f"Error getting S3 config ({type(e).__name__})", extra={"request_id": request_id})
             return None
 
     async def get_webhook_config(self, input_data, request_id: str = None) -> Optional[Dict]:
@@ -845,7 +858,7 @@ class PostprocessWorker:
                         'ovh_category': input_data.webhook.ovh_category(),
                         'user_id': input_data.webhook.user_id(),
                     }
-                    logger.info(f"Webhook config: {config_data}", extra={"request_id": request_id})
+                    logger.info("Webhook configuration resolved", extra={"request_id": request_id})
                     return config_data
             
             # Fall back to centralized config (which reads from environment)
@@ -867,5 +880,5 @@ class PostprocessWorker:
             return None
             
         except Exception as e:
-            logger.error(f"Error getting webhook config: {e}", extra={"request_id": request_id})
+            logger.error(f"Error getting webhook config ({type(e).__name__})", extra={"request_id": request_id})
             return None

@@ -375,7 +375,7 @@ async def _fire_session_close_retry(session_close_url: str, body: dict, request_
                     )
     except Exception as e:
         logger.warning(
-            f"Session close retry webhook call failed: {e}",
+            f"Session close retry webhook call failed ({type(e).__name__})",
             extra={"request_id": request_id},
         )
 
@@ -405,11 +405,13 @@ def _call_session_close(session_close_url: str, payload: Payload, retry: bool = 
         "session_auth": session_auth,
     }
     if retry:
+        if payload.input.image_observability:
+            input_body["image_observability"] = payload.input.image_observability
         body["retry"] = True
         body["input"] = input_body
     logger.info(
         f"Firing session close webhook (POST, retry={retry}) (fire-and-forget)",
-        extra={"request_id": request_id, "session_close_url": session_close_url},
+        extra={"request_id": request_id},
     )
     asyncio.create_task(_fire_session_close_retry(session_close_url, body, request_id))
 
@@ -461,14 +463,14 @@ async def generate(
         if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
             _call_session_close(session_close_url, payload, retry=True)
             logger.warning(
-                f"Generate rejected: health check failed for {request_id}: {health_error}, session close with retry requested.",
+                f"Generate rejected: health check failed for {request_id}, session close with retry requested.",
                 extra={"request_id": request_id},
             )
         else:
             if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
                 _call_session_close(session_close_url, payload, retry=False)
             logger.error(
-                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}: {health_error}.",
+                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}.",
                 extra={"request_id": request_id},
             )
         
@@ -492,7 +494,7 @@ async def generate(
         response.status_code = 202
         return result_pending
     except Exception as e:
-        logger.error(f"Failed to queue request {request_id}: {e}", extra={"request_id": request_id})
+        logger.error(f"Failed to queue request {request_id} ({type(e).__name__})", extra={"request_id": request_id})
         response.status_code = 500  # Internal Server Error
         failed_result = Result(
             id=request_id,
