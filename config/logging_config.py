@@ -8,6 +8,7 @@ Supports:
 - Structured logging with request context and trace correlation
 - Error tracking and metrics labels
 """
+from image_observability import ContextFilter
 import logging
 import sys
 import json
@@ -485,6 +486,8 @@ def get_logger(name: str, **context) -> logging.LoggerAdapter:
         logger.info("Processing job", extra={"request_id": "abc123"})
     """
     base_logger = logging.getLogger(name)
+    if not any(isinstance(f, ContextFilter) for f in base_logger.filters):
+        base_logger.addFilter(ContextFilter())
     return LoggerAdapter(base_logger, context)
 
 

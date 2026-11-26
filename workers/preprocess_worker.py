@@ -4,7 +4,7 @@ import time
 from modifiers.basemodifier import BaseModifier
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
-from image_observability import log_stage
+from image_observability import bind_context, reset_context, context_fields, log_stage
 
 logger = get_logger(__name__)
 
@@ -33,6 +33,7 @@ class PreprocessWorker:
             if request_id is None:
                 break
 
+            context_token = bind_context(None, request_id)
             self.in_flight_requests["preprocess"] += 1
             start_time = time.time()
             logger.info(
@@ -48,6 +49,7 @@ class PreprocessWorker:
             try:
                 # Get request and result from stores
                 request = await self.request_store.get(request_id)
+                bind_context(getattr(getattr(request, "input", None), "image_observability", None), request_id)
                 result = await self.response_store.get(request_id)
                 
                 if not request:
@@ -134,11 +136,14 @@ class PreprocessWorker:
                     )
             
             finally:
-                self.in_flight_requests["preprocess"] -= 1
-                if not ENGINE_NAME:
-                    clear_log_endpoint()
-                self.preprocess_queue.task_done()
-            
+                try:
+                    self.in_flight_requests["preprocess"] -= 1
+                    if not ENGINE_NAME:
+                        clear_log_endpoint()
+                    self.preprocess_queue.task_done()
+                finally:
+                    reset_context(context_token)
+
         logger.info(
             "Worker finished",
             extra={"worker_id": self.worker_id, "worker_type": "preprocess"}

@@ -9,7 +9,7 @@ from datetime import datetime
 from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET, COMFYUI_RETRIES
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
-from image_observability import log_stage
+from image_observability import bind_context, reset_context, context_fields, log_stage
 
 logger = get_logger(__name__)
 
@@ -43,6 +43,7 @@ class GenerationWorker:
             if request_id is None:
                 break
 
+            context_token = bind_context(None, request_id)
             self.in_flight_requests["generation"] += 1
             start_time = time.time()
             comfyui_job_id = None
@@ -61,6 +62,7 @@ class GenerationWorker:
             try:
                 # Get request and result from stores
                 request = await self.request_store.get(request_id)
+                bind_context(getattr(getattr(request, "input", None), "image_observability", None), request_id)
                 result = await self.response_store.get(request_id)
                 
                 if not request:
@@ -195,10 +197,13 @@ class GenerationWorker:
                     )
             
             finally:
-                self.in_flight_requests["generation"] -= 1
-                if not ENGINE_NAME:
-                    clear_log_endpoint()
-                self.generation_queue.task_done()
+                try:
+                    self.in_flight_requests["generation"] -= 1
+                    if not ENGINE_NAME:
+                        clear_log_endpoint()
+                    self.generation_queue.task_done()
+                finally:
+                    reset_context(context_token)
 
         logger.info(f"GenerationWorker {self.worker_id} finished", extra={"worker_id": self.worker_id, "worker_type": "generation"})
 

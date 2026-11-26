@@ -1,3 +1,4 @@
+from image_observability import bind_context, reset_context
 import asyncio
 import uuid
 import logging
@@ -364,19 +365,19 @@ async def _fire_session_close_retry(session_close_url: str, body: dict, request_
                 headers={"Content-Type": "application/json"},
             ) as resp:
                 if resp.status >= 400:
-                    logger.warning(
+                    logger.error(
                         f"Session close retry webhook returned {resp.status} for {request_id}",
-                        extra={"request_id": request_id},
+                        extra={"request_id": request_id, "error_category": "session_close_delivery"},
                     )
                 else:
                     logger.info(
                         f"Session close retry webhook accepted ({resp.status}) for {request_id}",
-                        extra={"request_id": request_id},
+                        extra={"request_id": request_id, "error_category": "session_close_delivery"},
                     )
     except Exception as e:
         logger.warning(
             f"Session close retry webhook call failed ({type(e).__name__})",
-            extra={"request_id": request_id},
+            extra={"request_id": request_id, "error_category": "session_close_delivery"},
         )
 
 
@@ -432,76 +433,80 @@ async def generate(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    if not ENGINE_NAME:
-        set_log_endpoint(extract_endpoint(payload))
-    logger.info(f"Generate request received", extra={"request_id": request_id})
-
-    # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
-    
-    if FOUND_UNHEALTHY:
-        is_healthy, health_error = False, "Instance previously failed a ComfyUI health check during /generate and no requests are in flight. FOUND_UNHEALTHY is True."
-    elif FORCE_HEALTH_CHECK_FAIL and random.randint(1, 3) == 1:
-        is_healthy, health_error = False, "Forced health check failure (FORCE_HEALTH_CHECK_FAIL=true, random 1-in-3)"
-        logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL (random 1-in-3 triggered)", extra={"request_id": request_id})
-    else:   
-        is_healthy, health_error = await _check_health(request_id)
-    if not is_healthy:
-        logger.info(f"Request entered Health Check Failed flow", extra={"request_id": request_id})
-        FOUND_UNHEALTHY = True
-        current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
-        under_threshold = current_retries < RETRY_THRESHOLD
-        logger.info(f"Health check: failed on /generate flow, and Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
-        session_close_url = (
-            payload.input.webhook.session_close_url
-            if payload.input.webhook and payload.input.webhook.session_close_url
-            else None
-        )
-        has_session_auth = (
-            payload.input.webhook
-            and getattr(payload.input.webhook, "session_auth_data", None)
-        )
-        if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
-            _call_session_close(session_close_url, payload, retry=True)
-            logger.warning(
-                f"Generate rejected: health check failed for {request_id}, session close with retry requested.",
-                extra={"request_id": request_id},
-            )
-        else:
-            if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
-                _call_session_close(session_close_url, payload, retry=False)
-            logger.error(
-                f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}.",
-                extra={"request_id": request_id},
-            )
-        
-        response.status_code = 200
-        return Result(
-            id=request_id,
-            status="failed",
-            message=f"Service unavailable: {health_error} for request ID : {request_id}",
-        )
-    result_pending = Result(id=request_id)
-
+    context_token = bind_context(payload.input.image_observability, request_id)
     try:
-        logger.info(f"Request entered Health Check Successful flow", extra={"request_id": request_id})
-        # Store request and initial result
-        await request_store.set(request_id, payload)
-        await response_store.set(request_id, result_pending)
-        await preprocess_queue.put(request_id)
-        in_flight_requests["total"] += 1
+        if not ENGINE_NAME:
+            set_log_endpoint(extract_endpoint(payload))
+        logger.info(f"Generate request received", extra={"request_id": request_id})
+
+        # Full health check (ComfyUI system stats) before accepting generate; same as GET /health?comfy=true
+    
+        if FOUND_UNHEALTHY:
+            is_healthy, health_error = False, "Instance previously failed a ComfyUI health check during /generate and no requests are in flight. FOUND_UNHEALTHY is True."
+        elif FORCE_HEALTH_CHECK_FAIL and random.randint(1, 3) == 1:
+            is_healthy, health_error = False, "Forced health check failure (FORCE_HEALTH_CHECK_FAIL=true, random 1-in-3)"
+            logger.info(f"Health check skipped: forced failure via FORCE_HEALTH_CHECK_FAIL (random 1-in-3 triggered)", extra={"request_id": request_id})
+        else:
+            is_healthy, health_error = await _check_health(request_id)
+        if not is_healthy:
+            logger.info(f"Request entered Health Check Failed flow", extra={"request_id": request_id})
+            FOUND_UNHEALTHY = True
+            current_retries = getattr(payload.input.webhook, "retries", 0) if payload.input.webhook else 0
+            under_threshold = current_retries < RETRY_THRESHOLD
+            logger.info(f"Health check: failed on /generate flow, and Current retries: {current_retries}, under threshold: {under_threshold}", extra={"request_id": request_id})
+            session_close_url = (
+                payload.input.webhook.session_close_url
+                if payload.input.webhook and payload.input.webhook.session_close_url
+                else None
+            )
+            has_session_auth = (
+                payload.input.webhook
+                and getattr(payload.input.webhook, "session_auth_data", None)
+            )
+            if under_threshold and session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
+                _call_session_close(session_close_url, payload, retry=True)
+                logger.warning(
+                    f"Generate rejected: health check failed for {request_id}, session close with retry requested.",
+                    extra={"request_id": request_id, "error_category": "admission_health"},
+                )
+            else:
+                if session_close_url and WebHook.is_url(session_close_url) and has_session_auth:
+                    _call_session_close(session_close_url, payload, retry=False)
+                logger.error(
+                    f"Generate rejected: retries ({current_retries}) >= threshold ({RETRY_THRESHOLD}), health check failed for {request_id}.",
+                    extra={"request_id": request_id, "error_category": "admission_health"},
+                )
         
-        logger.info(f"Queued request {request_id}", extra={"request_id": request_id})
-        response.status_code = 202
-        return result_pending
-    except Exception as e:
-        logger.error(f"Failed to queue request {request_id} ({type(e).__name__})", extra={"request_id": request_id})
-        response.status_code = 500  # Internal Server Error
-        failed_result = Result(
-            id=request_id,
-            status="failed",
-            message=f"Failed to queue request: {str(e)}"
-        )
-        return failed_result
+            response.status_code = 200
+            return Result(
+                id=request_id,
+                status="failed",
+                message=f"Service unavailable: {health_error} for request ID : {request_id}",
+            )
+        result_pending = Result(id=request_id)
+
+        try:
+            logger.info(f"Request entered Health Check Successful flow", extra={"request_id": request_id})
+            # Store request and initial result
+            await request_store.set(request_id, payload)
+            await response_store.set(request_id, result_pending)
+            await preprocess_queue.put(request_id)
+            in_flight_requests["total"] += 1
+        
+            logger.info(f"Queued request {request_id}", extra={"request_id": request_id})
+            response.status_code = 202
+            return result_pending
+        except Exception as e:
+            logger.error(f"Failed to queue request {request_id} ({type(e).__name__})", extra={"request_id": request_id, "error_category": "admission_queue"})
+            response.status_code = 500  # Internal Server Error
+            failed_result = Result(
+                id=request_id,
+                status="failed",
+                message=f"Failed to queue request: {str(e)}"
+            )
+            return failed_result
+    finally:
+        reset_context(context_token)
 
 # ===== SYNCHRONOUS ENDPOINT =====
 @asynccontextmanager
@@ -542,35 +547,39 @@ async def generate_sync(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    if not ENGINE_NAME:
-        set_log_endpoint(extract_endpoint(payload))
-
-    result_pending = Result(id=request_id)
-    await request_store.set(request_id, payload)
-    await response_store.set(request_id, result_pending)
-    await preprocess_queue.put(request_id)
-    in_flight_requests["total"] += 1
-
-    logger.info(f"Queued synchronous request {request_id}", extra={"request_id": request_id})
-
+    context_token = bind_context(payload.input.image_observability, request_id)
     try:
-        async with cancel_on_disconnect(request, request_id):
-            while True:
-                result = await response_store.get(request_id)
-                if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
-                    return result
-                await asyncio.sleep(0.5)
+        if not ENGINE_NAME:
+            set_log_endpoint(extract_endpoint(payload))
 
-    except asyncio.CancelledError:
-        # Clean return instead of exception bubble
-        return JSONResponse(
-            status_code=499,
-            content=Result(
-                id=request_id,
-                status="cancelled",
-                message="Client closed connection"
-            ).__dict__,
-        )
+        result_pending = Result(id=request_id)
+        await request_store.set(request_id, payload)
+        await response_store.set(request_id, result_pending)
+        await preprocess_queue.put(request_id)
+        in_flight_requests["total"] += 1
+
+        logger.info(f"Queued synchronous request {request_id}", extra={"request_id": request_id})
+
+        try:
+            async with cancel_on_disconnect(request, request_id):
+                while True:
+                    result = await response_store.get(request_id)
+                    if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
+                        return result
+                    await asyncio.sleep(0.5)
+
+        except asyncio.CancelledError:
+            # Clean return instead of exception bubble
+            return JSONResponse(
+                status_code=499,
+                content=Result(
+                    id=request_id,
+                    status="cancelled",
+                    message="Client closed connection"
+                ).__dict__,
+            )
+    finally:
+        reset_context(context_token)
 
 # ===== STREAMING ENDPOINT =====
 @app.post('/generate/stream')
@@ -586,35 +595,38 @@ async def generate_stream(
     if not payload.input.request_id:
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
-    if not ENGINE_NAME:
-        set_log_endpoint(extract_endpoint(payload))
-    
-    result_pending = Result(id=request_id)
-
+    context_token = bind_context(payload.input.image_observability, request_id)
     try:
-        # Store request and initial result
-        await request_store.set(request_id, payload)
-        await response_store.set(request_id, result_pending)
-        await preprocess_queue.put(request_id)
-        in_flight_requests["total"] += 1
-        
-        logger.info(f"Starting stream for request {request_id}", extra={"request_id": request_id})
-        
-        # Return streaming response
-        return StreamingResponse(
-            _stream_status_updates(request_id),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache", 
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"  # Disable nginx buffering
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to start stream for request {request_id}: {e}", extra={"request_id": request_id})
-        raise
+        if not ENGINE_NAME:
+            set_log_endpoint(extract_endpoint(payload))
+    
+        result_pending = Result(id=request_id)
 
+        try:
+            # Store request and initial result
+            await request_store.set(request_id, payload)
+            await response_store.set(request_id, result_pending)
+            await preprocess_queue.put(request_id)
+            in_flight_requests["total"] += 1
+        
+            logger.info(f"Starting stream for request {request_id}", extra={"request_id": request_id})
+        
+            # Return streaming response
+            return StreamingResponse(
+                _stream_status_updates(request_id),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"  # Disable nginx buffering
+                }
+            )
+        
+        except Exception as e:
+            logger.error(f"Failed to start stream for request {request_id} ({type(e).__name__})", extra={"request_id": request_id, "error_category": "admission_queue"})
+            raise
+    finally:
+        reset_context(context_token)
 
 # ===== HELPER FUNCTIONS =====
 
