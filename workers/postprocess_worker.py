@@ -21,7 +21,7 @@ from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, OVH_CONFIG, OVH_CONFIG_PUB
 WEBHOOK_RETRIES: int = WEBHOOK_CONFIG.get("retries", 3)
 from config.logging_config import get_logger, ErrorMetrics, ENGINE_NAME, extract_endpoint, set_log_endpoint, clear_log_endpoint
 
-from image_observability import ImageObservability, log_stage, project
+from image_observability import bind_context, reset_context, context_fields, ImageObservability, log_stage, project
 
 logger = get_logger(__name__)
 
@@ -65,6 +65,7 @@ class PostprocessWorker:
             if request_id is None:
                 break
 
+            context_token = bind_context(None, request_id)
             self.in_flight_requests["postprocess"] += 1
             start_time = time.time()
             s3_uploaded = False
@@ -84,6 +85,7 @@ class PostprocessWorker:
             try:
                 # Get request and result from stores
                 request = await self.request_store.get(request_id)
+                bind_context(getattr(getattr(request, "input", None), "image_observability", None), request_id)
                 result = await self.response_store.get(request_id)
                 
                 if not request:
@@ -232,57 +234,60 @@ class PostprocessWorker:
                     )
             
             finally:
-                self.in_flight_requests["postprocess"] -= 1
-                # Handle webhook - check payload first, then environment variables
-                webhook_config = await self.get_webhook_config(request.input, request_id)
-                if webhook_config:
-                    try:
-                        # Send regular webhook if URL is provided
-                        if webhook_config.get('url'):
-                            await self.send_webhook(
-                                webhook_config['url'], result, webhook_config.get('extra_params', {}),
-                                request_id, image_observability=request.input.image_observability,
-                            )
-                            webhook_sent = True
-                        
-                        # Send session-close webhook if URL is provided
-                        if webhook_config.get('session_close_url'):
-                            session_auth_data = webhook_config.get('session_auth_data')
-                            if session_auth_data is None:
-                                session_auth_data = {}
-                            logger.info(
-                                f"Sending session close webhook",
-                                extra={"request_id": request_id}
-                            )
-                            await self.send_webhook_for_session_close(webhook_config['session_close_url'], result, session_auth_data, request_id)
-                    except Exception as webhook_error:
-                        # Will not mark a 'completed' job as failed
-                        ErrorMetrics.log_error(
-                            logger, webhook_error, "webhook",
-                            request_id=request_id,
-                            worker_id=self.worker_id
-                        )
-                else:
-                    logger.info(
-                        f"No webhook configuration found",
-                        extra={"request_id": request_id}
-                    )
-                # Clean up the request store
                 try:
-                    await self.request_store.delete(request_id)
-                    logger.info(
-                        f"Cleaned up request",
-                        extra={"request_id": request_id}
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to clean up request: {e}",
-                        extra={"request_id": request_id}
-                    )
-                if not ENGINE_NAME:
-                    clear_log_endpoint()
-                self.in_flight_requests["total"] -= 1
-                self.postprocess_queue.task_done()
+                    self.in_flight_requests["postprocess"] -= 1
+                    # Handle webhook - check payload first, then environment variables
+                    webhook_config = await self.get_webhook_config(request.input, request_id)
+                    if webhook_config:
+                        try:
+                            # Send regular webhook if URL is provided
+                            if webhook_config.get('url'):
+                                await self.send_webhook(
+                                    webhook_config['url'], result, webhook_config.get('extra_params', {}),
+                                    request_id, image_observability=request.input.image_observability,
+                                )
+                                webhook_sent = True
+
+                            # Send session-close webhook if URL is provided
+                            if webhook_config.get('session_close_url'):
+                                session_auth_data = webhook_config.get('session_auth_data')
+                                if session_auth_data is None:
+                                    session_auth_data = {}
+                                logger.info(
+                                    f"Sending session close webhook",
+                                    extra={"request_id": request_id}
+                                )
+                                await self.send_webhook_for_session_close(webhook_config['session_close_url'], result, session_auth_data, request_id)
+                        except Exception as webhook_error:
+                            # Will not mark a 'completed' job as failed
+                            ErrorMetrics.log_error(
+                                logger, webhook_error, "webhook",
+                                request_id=request_id,
+                                worker_id=self.worker_id
+                            )
+                    else:
+                        logger.info(
+                            f"No webhook configuration found",
+                            extra={"request_id": request_id}
+                        )
+                    # Clean up the request store
+                    try:
+                        await self.request_store.delete(request_id)
+                        logger.info(
+                            f"Cleaned up request",
+                            extra={"request_id": request_id}
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to clean up request: {e}",
+                            extra={"request_id": request_id}
+                        )
+                    if not ENGINE_NAME:
+                        clear_log_endpoint()
+                    self.in_flight_requests["total"] -= 1
+                    self.postprocess_queue.task_done()
+                finally:
+                    reset_context(context_token)
             
         logger.info(
             "Worker finished",
@@ -710,6 +715,7 @@ class PostprocessWorker:
             webhook_data.update(extra_params)
         
         metadata = project(image_observability)
+        callback_context = context_fields(metadata, request_id)
         if metadata:
             webhook_data["image_observability"] = metadata
             log_stage(logger, metadata, request_id, "callback", "started")
@@ -724,26 +730,26 @@ class PostprocessWorker:
                         headers={'Content-Type': 'application/json'}
                     ) as response:
                         if response.status < 400:
-                            logger.info("Webhook sent successfully", extra={"request_id": request_id})
+                            logger.info("Webhook sent successfully", extra=callback_context)
                             return
                         
                         await response.text()
                         # 4xx = client error, don't retry
                         if response.status < 500:
-                            logger.warning(f"Webhook failed (status {response.status})", extra={"request_id": request_id})
+                            logger.error(f"Webhook failed (status {response.status})", extra={**callback_context, "error_category": "callback_delivery"})
                             return
                         
                         # 5xx = server error, retry
                         last_error = f"HTTP {response.status}"
                         logger.warning(
                             f"Webhook attempt {attempt}/{WEBHOOK_RETRIES} failed ({last_error})",
-                            extra={"request_id": request_id}
+                            extra={**callback_context, "error_category": "callback_delivery"}
                         )
             except Exception as e:
                 last_error = type(e).__name__
                 logger.warning(
                     f"Webhook attempt {attempt}/{WEBHOOK_RETRIES} error: {last_error}",
-                    extra={"request_id": request_id}
+                    extra={**callback_context, "error_category": "callback_delivery"}
                 )
             
             # Exponential backoff before next retry (10s, 20s, 40s, …)
@@ -753,7 +759,7 @@ class PostprocessWorker:
         
         logger.error(
             f"Webhook failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
-            extra={"request_id": request_id}
+            extra={**callback_context, "error_category": "callback_delivery"}
         )
         # Don't raise - webhook failures shouldn't fail the whole job
 
@@ -790,20 +796,20 @@ class PostprocessWorker:
                         await response.text()
                         # 4xx = client error, don't retry
                         if response.status < 500:
-                            logger.warning(f"Session close webhook failed (status {response.status})", extra={"request_id": request_id})
+                            logger.error(f"Session close webhook failed (status {response.status})", extra={"request_id": request_id, "error_category": "session_close_delivery"})
                             return
                         
                         # 5xx = server error, retry
                         last_error = f"HTTP {response.status}"
                         logger.warning(
                             f"Session close webhook attempt {attempt}/{WEBHOOK_RETRIES} failed ({last_error})",
-                            extra={"request_id": request_id}
+                            extra={"request_id": request_id, "error_category": "session_close_delivery"}
                         )
             except Exception as e:
                 last_error = type(e).__name__
                 logger.warning(
                     f"Session close webhook attempt {attempt}/{WEBHOOK_RETRIES} error: {last_error}",
-                    extra={"request_id": request_id}
+                    extra={"request_id": request_id, "error_category": "session_close_delivery"}
                 )
             
             # Exponential backoff before next retry (10s, 20s, 40s, …)
@@ -813,7 +819,7 @@ class PostprocessWorker:
         
         logger.error(
             f"Session close webhook failed after {WEBHOOK_RETRIES} attempts. Last error: {last_error}",
-            extra={"request_id": request_id}
+            extra={"request_id": request_id, "error_category": "session_close_delivery"}
         )
         # Don't raise - webhook failures shouldn't fail the whole job
 
